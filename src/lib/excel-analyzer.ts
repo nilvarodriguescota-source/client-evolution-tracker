@@ -1,18 +1,9 @@
 import * as XLSX from "xlsx";
 
-export interface RawRow {
-  Cliente: string;
-  Produto: string;
-  "Código do Produto": string | number;
-  "Valor Unitário": number;
-  Quantidade: number;
-  "Valor Total por Produto": number;
-  "Total Geral": number;
-}
-
 export interface ProductDetail {
   produto: string;
   codigo: string;
+  unidade: string;
   valorUnitario: number;
   quantidade: number;
   valorTotal: number;
@@ -21,6 +12,7 @@ export interface ProductDetail {
 
 export interface ClientData {
   nome: string;
+  codigoCliente: string;
   produtos: ProductDetail[];
   totalGeral: number;
 }
@@ -56,46 +48,85 @@ export interface AnalysisResult {
 }
 
 function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
-  const rows = XLSX.utils.sheet_to_json<RawRow>(sheet);
+  const rows: (string | number | null)[][] = XLSX.utils.sheet_to_json(sheet, {
+    header: 1,
+    defval: null,
+  });
+
   const clientes = new Map<string, ClientData>();
+  let currentClient: ClientData | null = null;
 
   for (const row of rows) {
-    const clienteNome = String(row.Cliente ?? "").trim();
-    if (!clienteNome) continue;
+    if (!row || row.length === 0) continue;
 
-    const produto: ProductDetail = {
-      produto: String(row.Produto ?? ""),
-      codigo: String(row["Código do Produto"] ?? ""),
-      valorUnitario: Number(row["Valor Unitário"]) || 0,
-      quantidade: Number(row.Quantidade) || 0,
-      valorTotal: Number(row["Valor Total por Produto"]) || 0,
-      validado: false,
-    };
+    const firstCell = String(row[0] ?? "").trim();
 
-    const calculado = +(produto.valorUnitario * produto.quantidade).toFixed(2);
-    produto.validado = Math.abs(calculado - produto.valorTotal) < 0.02;
-
-    if (!clientes.has(clienteNome)) {
-      clientes.set(clienteNome, {
-        nome: clienteNome,
-        produtos: [],
-        totalGeral: 0,
-      });
+    // Detect client header: "Cliente: XXXXX - NOME - ..."
+    if (firstCell.startsWith("Cliente:")) {
+      const match = firstCell.match(/Cliente:\s*(\d+)\s*-\s*(.+?)(?:\s*-\s*Data|$)/);
+      if (match) {
+        const codigoCliente = match[1];
+        const nomeCliente = match[2].trim();
+        currentClient = {
+          nome: nomeCliente,
+          codigoCliente,
+          produtos: [],
+          totalGeral: 0,
+        };
+        clientes.set(nomeCliente, currentClient);
+      }
+      continue;
     }
-    const c = clientes.get(clienteNome)!;
-    // avoid duplicate product entries
-    const existing = c.produtos.find(
-      (p) => p.codigo === produto.codigo && p.produto === produto.produto
-    );
-    if (!existing) {
-      c.produtos.push(produto);
+
+    // Skip header row, empty rows, totals section
+    if (
+      firstCell === "Código" ||
+      firstCell === "" ||
+      firstCell === "Totais por unidade:" ||
+      firstCell.startsWith("Quantidade total") ||
+      firstCell.startsWith("Gerado em")
+    ) {
+      continue;
+    }
+
+    // Check if it's a product row (first cell is a numeric code)
+    const codigo = firstCell;
+    const isProductRow = /^\d+$/.test(codigo) && currentClient;
+
+    if (isProductRow && currentClient) {
+      const descricao = String(row[1] ?? "");
+      const unidade = String(row[2] ?? "");
+      const quantidade = Number(row[3]) || 0;
+      const precoMedio = Number(row[4]) || 0;
+      const vendaBruta = Number(row[5]) || 0;
+
+      const calculado = +(precoMedio * quantidade).toFixed(2);
+      const validado = Math.abs(calculado - vendaBruta) < 0.1;
+
+      currentClient.produtos.push({
+        produto: descricao,
+        codigo,
+        unidade,
+        valorUnitario: precoMedio,
+        quantidade,
+        valorTotal: vendaBruta,
+        validado,
+      });
+      continue;
+    }
+
+    // Subtotal row: first cell empty, col[3] has qty total, col[5] has value total
+    if (!firstCell && currentClient && row[3] && row[5]) {
+      currentClient.totalGeral = Number(row[5]) || 0;
+      continue;
     }
   }
 
-  // recalculate totals
+  // Recalculate totals from products for consistency
   let totalFaturamento = 0;
   for (const c of clientes.values()) {
-    c.totalGeral = c.produtos.reduce((s, p) => s + p.valorTotal, 0);
+    const sumProdutos = c.produtos.reduce((s, p) => s + p.valorTotal, 0);
+    if (c.totalGeral === 0) c.totalGeral = sumProdutos;
     totalFaturamento += c.totalGeral;
   }
 
@@ -194,7 +225,7 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
       for (const p of c.produtos) {
         if (!p.validado) {
           inconsistencias.push(
-            `${period.nome} → ${c.nome} → ${p.produto}: Valor Total (${p.valorTotal.toFixed(2)}) ≠ Unitário (${p.valorUnitario.toFixed(2)}) × Qtd (${p.quantidade})`
+            `${period.nome} → ${c.nome} → ${p.produto}: Valor (${p.valorTotal.toFixed(2)}) ≠ Preço médio (${p.valorUnitario.toFixed(2)}) × Qtd (${p.quantidade})`
           );
         }
       }
