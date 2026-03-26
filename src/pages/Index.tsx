@@ -56,10 +56,13 @@ const Index = () => {
         {!result && !error && (
           <div className="py-16 text-center">
             <p className="text-lg text-muted-foreground">
-              Carregue uma planilha Excel com pelo menos duas abas para começar a análise.
+              Carregue uma planilha Excel (.xls ou .xlsx) com pelo menos duas abas para começar a análise.
             </p>
             <p className="mt-2 text-sm text-muted-foreground">
-              Colunas esperadas: Cliente, Produto, Código do Produto, Valor Unitário, Quantidade, Valor Total por Produto, Total Geral
+              Colunas esperadas: Código, Descrição, UN, Qtd. venda, Preço médio venda, Venda bruta
+            </p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Os clientes devem estar separados por linhas de cabeçalho no formato "Cliente: CÓDIGO - NOME - ..."
             </p>
           </div>
         )}

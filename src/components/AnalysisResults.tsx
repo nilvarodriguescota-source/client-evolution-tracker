@@ -264,7 +264,7 @@ function ClientTable({
   clients,
   emptyMessage,
 }: {
-  clients: { nome: string; produtos: { produto: string; codigo: string; quantidade: number; valorTotal: number }[]; totalGeral: number }[];
+  clients: { nome: string; codigoCliente?: string; produtos: { produto: string; codigo: string; unidade?: string; quantidade: number; valorTotal: number }[]; totalGeral: number }[];
   emptyMessage: string;
 }) {
   if (clients.length === 0) {
