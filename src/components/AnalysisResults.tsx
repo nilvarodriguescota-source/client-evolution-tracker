@@ -8,6 +8,11 @@ import {
   TrendingDown,
   Package,
   AlertTriangle,
+  ShieldCheck,
+  ShieldAlert,
+  CheckCircle2,
+  XCircle,
+  Info,
 } from "lucide-react";
 import { KpiCard } from "./KpiCard";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -32,13 +37,19 @@ import {
   Legend,
 } from "recharts";
 import type { AnalysisResult } from "@/lib/excel-analyzer";
+import type { ValidationDiagnostic, ValidationSeverity } from "@/lib/excel-validator";
 
 interface Props {
   result: AnalysisResult;
 }
 
 const fmt = (v: number) =>
-  v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+  v.toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 
 export function AnalysisResults({ result }: Props) {
   const [tab, setTab] = useState("resumo");
@@ -48,6 +59,11 @@ export function AnalysisResults({ result }: Props) {
     [result.periodoAnterior.nome]: p.valorAnterior,
     [result.periodoAtual.nome]: p.valorAtual,
   }));
+
+  const vr = result.validationReport;
+  const hasAlerts = result.inconsistencias.length > 0 || vr.diagnostics.length > 0;
+  const errorCount = vr.diagnostics.filter((d) => d.severity === "error").length;
+  const warningCount = vr.diagnostics.filter((d) => d.severity === "warning").length;
 
   return (
     <div className="space-y-6">
@@ -83,6 +99,27 @@ export function AnalysisResults({ result }: Props) {
         />
       </div>
 
+      {/* Validation summary banner */}
+      <Card className={vr.valid ? "border-accent/50 bg-accent/5" : "border-destructive/50 bg-destructive/5"}>
+        <CardContent className="flex items-center gap-3 py-3">
+          {vr.valid ? (
+            <ShieldCheck className="h-5 w-5 text-accent" />
+          ) : (
+            <ShieldAlert className="h-5 w-5 text-destructive" />
+          )}
+          <div className="flex-1 text-sm">
+            <span className="font-medium">
+              {vr.valid ? "Dados validados com sucesso" : "Inconsistências detectadas nos dados"}
+            </span>
+            <span className="ml-2 text-muted-foreground">
+              {vr.passedChecks}/{vr.totalChecks} verificações aprovadas
+              {errorCount > 0 && ` · ${errorCount} erro${errorCount > 1 ? "s" : ""}`}
+              {warningCount > 0 && ` · ${warningCount} aviso${warningCount > 1 ? "s" : ""}`}
+            </span>
+          </div>
+        </CardContent>
+      </Card>
+
       {/* Tabs */}
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList className="w-full justify-start">
@@ -94,11 +131,14 @@ export function AnalysisResults({ result }: Props) {
             Clientes Perdidos ({result.clientesPerdidos.length})
           </TabsTrigger>
           <TabsTrigger value="produtos">Comparativo Produtos</TabsTrigger>
-          {result.inconsistencias.length > 0 && (
+          {hasAlerts && (
             <TabsTrigger value="alertas" className="text-destructive">
               Alertas ({result.inconsistencias.length})
             </TabsTrigger>
           )}
+          <TabsTrigger value="validacao">
+            Validação
+          </TabsTrigger>
         </TabsList>
 
         {/* Resumo */}
@@ -113,7 +153,7 @@ export function AnalysisResults({ result }: Props) {
               <CardContent className="space-y-3 text-sm">
                 <Row label={`Faturamento ${result.periodoAnterior.nome}`} value={fmt(result.periodoAnterior.totalFaturamento)} />
                 <Row label={`Faturamento ${result.periodoAtual.nome}`} value={fmt(result.periodoAtual.totalFaturamento)} />
-                <Row label="Variação" value={`${result.variacaoFaturamento >= 0 ? "+" : ""}${result.variacaoFaturamento.toFixed(1)}%`} highlight />
+                <Row label="Variação" value={`${result.variacaoFaturamento >= 0 ? "+" : ""}${result.variacaoFaturamento.toFixed(2)}%`} highlight />
                 <hr className="border-border" />
                 <Row label="Clientes mantidos" value={String(result.clientesMantidos.length)} />
                 <Row label="Clientes novos" value={String(result.clientesNovos.length)} />
@@ -209,7 +249,7 @@ export function AnalysisResults({ result }: Props) {
         </TabsContent>
 
         {/* Alertas */}
-        {result.inconsistencias.length > 0 && (
+        {hasAlerts && (
           <TabsContent value="alertas">
             <Card>
               <CardHeader>
@@ -220,16 +260,168 @@ export function AnalysisResults({ result }: Props) {
               <CardContent className="space-y-2">
                 {result.inconsistencias.map((msg, i) => (
                   <p key={i} className="text-sm text-muted-foreground">
-                    • {msg}
+                    {msg}
                   </p>
                 ))}
               </CardContent>
             </Card>
           </TabsContent>
         )}
+
+        {/* Validation Report Tab */}
+        <TabsContent value="validacao" className="space-y-4">
+          {/* Layer summary */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <ShieldCheck className="h-4 w-4 text-primary" /> Resumo de Validação por Camada
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Camada</TableHead>
+                    <TableHead className="text-right">Aprovadas</TableHead>
+                    <TableHead className="text-right">Falhas</TableHead>
+                    <TableHead className="text-right">Total</TableHead>
+                    <TableHead className="text-right">Taxa</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {Object.entries(vr.layerSummary).map(([layer, counts]) => {
+                    const total = counts.passed + counts.failed;
+                    const rate = total > 0 ? (counts.passed / total) * 100 : 100;
+                    return (
+                      <TableRow key={layer}>
+                        <TableCell className="font-medium capitalize">{layerLabel(layer)}</TableCell>
+                        <TableCell className="text-right text-accent">{counts.passed}</TableCell>
+                        <TableCell className="text-right text-destructive">{counts.failed}</TableCell>
+                        <TableCell className="text-right">{total}</TableCell>
+                        <TableCell className="text-right">
+                          <Badge
+                            variant="outline"
+                            className={
+                              rate === 100
+                                ? "border-accent/30 bg-accent/10 text-accent"
+                                : rate >= 90
+                                ? "border-yellow-500/30 bg-yellow-500/10 text-yellow-600"
+                                : "border-destructive/30 bg-destructive/10 text-destructive"
+                            }
+                          >
+                            {rate.toFixed(1)}%
+                          </Badge>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                  <TableRow className="font-semibold">
+                    <TableCell>Total</TableCell>
+                    <TableCell className="text-right text-accent">{vr.passedChecks}</TableCell>
+                    <TableCell className="text-right text-destructive">{vr.failedChecks}</TableCell>
+                    <TableCell className="text-right">{vr.totalChecks}</TableCell>
+                    <TableCell className="text-right">
+                      <Badge
+                        variant="outline"
+                        className={
+                          vr.valid
+                            ? "border-accent/30 bg-accent/10 text-accent"
+                            : "border-destructive/30 bg-destructive/10 text-destructive"
+                        }
+                      >
+                        {vr.totalChecks > 0 ? ((vr.passedChecks / vr.totalChecks) * 100).toFixed(1) : "100.0"}%
+                      </Badge>
+                    </TableCell>
+                  </TableRow>
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+
+          {/* Detailed diagnostics */}
+          {vr.diagnostics.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <AlertTriangle className="h-4 w-4 text-destructive" /> Diagnósticos Detalhados
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="p-0">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-[60px]">Sev.</TableHead>
+                      <TableHead>Camada</TableHead>
+                      <TableHead>Célula</TableHead>
+                      <TableHead>Campo</TableHead>
+                      <TableHead>Esperado</TableHead>
+                      <TableHead>Encontrado</TableHead>
+                      <TableHead>Impacto</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {vr.diagnostics.map((d, i) => (
+                      <TableRow key={i}>
+                        <TableCell>
+                          <SeverityIcon severity={d.severity} />
+                        </TableCell>
+                        <TableCell className="capitalize text-xs">{layerLabel(d.layer)}</TableCell>
+                        <TableCell className="font-mono text-xs">{d.cellRef}</TableCell>
+                        <TableCell className="text-xs">{d.field}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground max-w-[200px] truncate" title={d.expected}>{d.expected}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground max-w-[200px] truncate" title={d.actual}>{d.actual}</TableCell>
+                        <TableCell className="text-xs max-w-[300px]" title={d.impact}>{d.impact}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </CardContent>
+            </Card>
+          )}
+
+          {vr.diagnostics.length === 0 && (
+            <Card>
+              <CardContent className="flex items-center gap-3 py-8 justify-center text-accent">
+                <CheckCircle2 className="h-6 w-6" />
+                <span className="text-lg font-medium">
+                  Nenhum diagnóstico — todos os dados são consistentes com a planilha de origem.
+                </span>
+              </CardContent>
+            </Card>
+          )}
+        </TabsContent>
       </Tabs>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Helper components
+// ---------------------------------------------------------------------------
+
+function layerLabel(layer: string): string {
+  const labels: Record<string, string> = {
+    existence: "Existência",
+    type: "Tipo",
+    integrity: "Integridade",
+    structure: "Estrutura",
+    traceability: "Rastreabilidade",
+    math: "Matemática",
+    duplicate: "Duplicidade",
+    "cross-field": "Campos Cruzados",
+  };
+  return labels[layer] || layer;
+}
+
+function SeverityIcon({ severity }: { severity: ValidationSeverity }) {
+  switch (severity) {
+    case "error":
+      return <XCircle className="h-4 w-4 text-destructive" />;
+    case "warning":
+      return <AlertTriangle className="h-4 w-4 text-yellow-500" />;
+    case "info":
+      return <Info className="h-4 w-4 text-blue-500" />;
+  }
 }
 
 function Row({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
@@ -255,7 +447,7 @@ function VariationBadge({ value }: { value: number }) {
       }
     >
       {value > 0 ? "+" : ""}
-      {value.toFixed(1)}%
+      {value.toFixed(2)}%
     </Badge>
   );
 }
