@@ -36,7 +36,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
-import type { AnalysisResult } from "@/lib/excel-analyzer";
+import type { AnalysisResult, StatusCarteira } from "@/lib/excel-analyzer";
 import type { ValidationDiagnostic, ValidationSeverity } from "@/lib/excel-validator";
 
 interface Props {
@@ -131,6 +131,9 @@ export function AnalysisResults({ result }: Props) {
             Clientes Perdidos ({result.clientesPerdidos.length})
           </TabsTrigger>
           <TabsTrigger value="produtos">Comparativo Produtos</TabsTrigger>
+          <TabsTrigger value="carteira">
+            Carteira ({result.periodos.length}m)
+          </TabsTrigger>
           {hasAlerts && (
             <TabsTrigger value="alertas" className="text-destructive">
               Alertas ({result.inconsistencias.length})
@@ -246,6 +249,11 @@ export function AnalysisResults({ result }: Props) {
               </Table>
             </CardContent>
           </Card>
+        </TabsContent>
+
+        {/* Carteira 6 Meses */}
+        <TabsContent value="carteira" className="space-y-4">
+          <CarteiraAnalysis result={result} />
         </TabsContent>
 
         {/* Alertas */}
@@ -449,6 +457,121 @@ function VariationBadge({ value }: { value: number }) {
       {value > 0 ? "+" : ""}
       {value.toFixed(2)}%
     </Badge>
+  );
+}
+
+const STATUS_CONFIG: Record<
+  StatusCarteira,
+  { label: string; className: string }
+> = {
+  ativo: {
+    label: "Ativo",
+    className: "border-accent/30 bg-accent/10 text-accent",
+  },
+  frequencia_reduzida: {
+    label: "Frequência Reduzida",
+    className: "border-yellow-500/30 bg-yellow-500/10 text-yellow-600",
+  },
+  risco_abandono: {
+    label: "Risco de Abandono",
+    className: "border-orange-500/30 bg-orange-500/10 text-orange-600",
+  },
+  inativo: {
+    label: "Inativo",
+    className: "border-destructive/30 bg-destructive/10 text-destructive",
+  },
+};
+
+function CarteiraAnalysis({ result }: { result: AnalysisResult }) {
+  const { classificacaoCarteira, periodos } = result;
+
+  const counts: Record<StatusCarteira, number> = {
+    ativo: 0,
+    frequencia_reduzida: 0,
+    risco_abandono: 0,
+    inativo: 0,
+  };
+  for (const c of classificacaoCarteira) counts[c.status]++;
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">
+            Análise de Carteira — Histórico de {periodos.length}{" "}
+            {periodos.length === 1 ? "Mês" : "Meses"}
+          </CardTitle>
+          <p className="text-xs text-muted-foreground">
+            Períodos considerados:{" "}
+            {periodos.map((p) => p.nome).join(" → ")}
+          </p>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {(Object.entries(counts) as [StatusCarteira, number][]).map(
+              ([status, count]) => (
+                <div
+                  key={status}
+                  className="rounded-lg border p-3 text-center"
+                >
+                  <div className="text-2xl font-bold">{count}</div>
+                  <Badge
+                    variant="outline"
+                    className={`mt-1 text-xs ${STATUS_CONFIG[status].className}`}
+                  >
+                    {STATUS_CONFIG[status].label}
+                  </Badge>
+                </div>
+              ),
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Cliente</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Último Período</TableHead>
+                <TableHead className="text-right">Meses Presente</TableHead>
+                <TableHead>Histórico</TableHead>
+                <TableHead className="text-right">Fat. Último Período</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {classificacaoCarteira.map((c) => (
+                <TableRow key={c.nome}>
+                  <TableCell className="font-medium">{c.nome}</TableCell>
+                  <TableCell>
+                    <Badge
+                      variant="outline"
+                      className={STATUS_CONFIG[c.status].className}
+                    >
+                      {STATUS_CONFIG[c.status].label}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="text-muted-foreground text-sm">
+                    {c.ultimoPeriodo}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    {c.totalPeriodosPresente}/{periodos.length}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {c.periodosPresente.join(", ")}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    {fmt(c.faturamentoUltimoPeriodo)}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
   );
 }
 

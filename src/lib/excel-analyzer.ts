@@ -71,9 +71,27 @@ export interface ProductComparison {
   variacaoValor: number;
 }
 
+export type StatusCarteira =
+  | "ativo"
+  | "frequencia_reduzida"
+  | "risco_abandono"
+  | "inativo";
+
+export interface ClienteCarteira {
+  nome: string;
+  codigoCliente?: string;
+  status: StatusCarteira;
+  ultimoPeriodo: string;
+  totalPeriodosPresente: number;
+  periodosPresente: string[];
+  faturamentoUltimoPeriodo: number;
+}
+
 export interface AnalysisResult {
   periodoAnterior: PeriodData;
   periodoAtual: PeriodData;
+  /** All parsed periods used for the 6-month portfolio analysis (up to 6, oldest first) */
+  periodos: PeriodData[];
   clientesNovos: ClientData[];
   clientesPerdidos: ClientData[];
   clientesMantidos: string[];
@@ -82,6 +100,8 @@ export interface AnalysisResult {
   variacaoFaturamento: number;
   comparativoProdutos: ProductComparison[];
   inconsistencias: string[];
+  /** 6-month portfolio classification for every client found in any period */
+  classificacaoCarteira: ClienteCarteira[];
   /** Combined validation report from all layers */
   validationReport: ValidationReport;
 }
@@ -308,6 +328,54 @@ function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
 }
 
 // ---------------------------------------------------------------------------
+// 6-month portfolio classifier
+// ---------------------------------------------------------------------------
+
+function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
+  const n = periodos.length;
+  const allClients = new Map<string, { indicesPresente: number[]; codigoCliente?: string }>();
+
+  for (let i = 0; i < n; i++) {
+    for (const [nome, client] of periodos[i].clientes) {
+      if (!allClients.has(nome)) {
+        allClients.set(nome, { indicesPresente: [], codigoCliente: client.codigoCliente });
+      }
+      allClients.get(nome)!.indicesPresente.push(i);
+    }
+  }
+
+  const result: ClienteCarteira[] = [];
+  for (const [nome, data] of allClients) {
+    const lastIdx = Math.max(...data.indicesPresente);
+    // 0 = current period, 1 = one period back, etc.
+    const distanceFromEnd = n - 1 - lastIdx;
+
+    let status: StatusCarteira;
+    if (distanceFromEnd === 0) {
+      status = "ativo";
+    } else if (distanceFromEnd === 1) {
+      status = "frequencia_reduzida";
+    } else if (distanceFromEnd <= 3) {
+      status = "risco_abandono";
+    } else {
+      status = "inativo";
+    }
+
+    result.push({
+      nome,
+      codigoCliente: data.codigoCliente,
+      status,
+      ultimoPeriodo: periodos[lastIdx].nome,
+      totalPeriodosPresente: data.indicesPresente.length,
+      periodosPresente: data.indicesPresente.map((i) => periodos[i].nome),
+      faturamentoUltimoPeriodo: periodos[lastIdx].clientes.get(nome)?.totalGeral ?? 0,
+    });
+  }
+
+  return result.sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
+}
+
+// ---------------------------------------------------------------------------
 // Main analysis entry point
 // ---------------------------------------------------------------------------
 
@@ -319,11 +387,16 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   }
 
   const sheetNames = wb.SheetNames;
-  const anteriorName = sheetNames[sheetNames.length - 2];
-  const atualName = sheetNames[sheetNames.length - 1];
+  // Use up to 6 most recent sheets for the portfolio analysis window
+  const maxPeriods = Math.min(sheetNames.length, 6);
+  const periodSheetNames = sheetNames.slice(sheetNames.length - maxPeriods);
 
-  const periodoAnterior = parsePeriod(wb.Sheets[anteriorName], anteriorName);
-  const periodoAtual = parsePeriod(wb.Sheets[atualName], atualName);
+  const periodos = periodSheetNames.map((name) =>
+    parsePeriod(wb.Sheets[name], name),
+  );
+
+  const periodoAnterior = periodos[periodos.length - 2];
+  const periodoAtual = periodos[periodos.length - 1];
 
   // ---- Client comparison -----------------------------------------------------
   const nomesAnterior = new Set(periodoAnterior.clientes.keys());
@@ -438,37 +511,17 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     }
   }
 
-  // ---- Merge validation reports into one combined report ----------------------
-  const combinedValidator = new ExcelValidator("global");
-  combinedValidator.merge(
-    // reconstruct from reports
-    Object.assign(new ExcelValidator(anteriorName), {
-      diagnostics: periodoAnterior.validationReport.diagnostics,
-      totalChecks: periodoAnterior.validationReport.totalChecks,
-      passedChecks: periodoAnterior.validationReport.passedChecks,
-      layerCounts: periodoAnterior.validationReport.layerSummary,
-    }) as unknown as ExcelValidator,
-  );
-  combinedValidator.merge(
-    Object.assign(new ExcelValidator(atualName), {
-      diagnostics: periodoAtual.validationReport.diagnostics,
-      totalChecks: periodoAtual.validationReport.totalChecks,
-      passedChecks: periodoAtual.validationReport.passedChecks,
-      layerCounts: periodoAtual.validationReport.layerSummary,
-    }) as unknown as ExcelValidator,
-  );
+  // ---- 6-month portfolio classification ---------------------------------------
+  const classificacaoCarteira = classificarCarteira(periodos);
 
-  // Build a proper combined report
-  const allDiagnostics = [
-    ...periodoAnterior.validationReport.diagnostics,
-    ...periodoAtual.validationReport.diagnostics,
-  ];
-  const totalChecks = periodoAnterior.validationReport.totalChecks + periodoAtual.validationReport.totalChecks;
-  const passedChecks = periodoAnterior.validationReport.passedChecks + periodoAtual.validationReport.passedChecks;
+  // ---- Merge validation reports into one combined report ----------------------
+  const allDiagnostics = periodos.flatMap((p) => p.validationReport.diagnostics);
+  const totalChecks = periodos.reduce((s, p) => s + p.validationReport.totalChecks, 0);
+  const passedChecks = periodos.reduce((s, p) => s + p.validationReport.passedChecks, 0);
 
   const layerSummary: Record<string, { passed: number; failed: number }> = {};
-  for (const report of [periodoAnterior.validationReport, periodoAtual.validationReport]) {
-    for (const [layer, counts] of Object.entries(report.layerSummary)) {
+  for (const period of periodos) {
+    for (const [layer, counts] of Object.entries(period.validationReport.layerSummary)) {
       if (!layerSummary[layer]) layerSummary[layer] = { passed: 0, failed: 0 };
       layerSummary[layer].passed += counts.passed;
       layerSummary[layer].failed += counts.failed;
@@ -487,6 +540,7 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   return {
     periodoAnterior,
     periodoAtual,
+    periodos,
     clientesNovos,
     clientesPerdidos,
     clientesMantidos,
@@ -495,6 +549,7 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     variacaoFaturamento,
     comparativoProdutos,
     inconsistencias,
+    classificacaoCarteira,
     validationReport,
   };
 }
