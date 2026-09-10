@@ -16,6 +16,8 @@ import {
   CalendarRange,
   RotateCcw,
   FileSpreadsheet,
+  ArrowRight,
+  Minus,
 } from "lucide-react";
 import { KpiCard } from "./KpiCard";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -38,8 +40,16 @@ import {
   Tooltip,
   ResponsiveContainer,
   Legend,
+  LabelList,
+  ReferenceLine,
 } from "recharts";
-import type { AnalysisResult, StatusCarteira, ClienteCarteira } from "@/lib/excel-analyzer";
+import type {
+  AnalysisResult,
+  StatusCarteira,
+  ClienteCarteira,
+  TransicaoPeriodo,
+  Tendencia,
+} from "@/lib/excel-analyzer";
 import type { ValidationDiagnostic, ValidationSeverity } from "@/lib/excel-validator";
 
 interface Props {
@@ -65,11 +75,25 @@ export function AnalysisResults({ result }: Props) {
     ...Object.fromEntries(periodNames.map((n) => [n, p.valorPorPeriodo[n] ?? 0])),
   }));
 
-  const evolucaoChartData = result.evolucaoPeriodos.map((p) => ({
+  // One measure per chart: revenue and client movement are read on their own
+  // scale instead of being squeezed onto two axes of the same plot.
+  const faturamentoChartData = result.evolucaoPeriodos.map((p) => ({
     nome: p.nome,
     Faturamento: p.faturamento,
     Clientes: p.clientes,
   }));
+
+  // One group per transition: who stayed, who came in, who left.
+  const movimentacaoChartData = result.transicoes.map((t) => ({
+    nome: `${t.de} → ${t.para}`,
+    Mantidos: t.mantidos.total,
+    Retornados: t.retornados.total,
+    Novos: t.novos.total,
+    Perdidos: -t.perdidos.total,
+  }));
+
+  const ec = result.evolucaoConsolidada;
+  const ultimaTransicao = result.transicoes[result.transicoes.length - 1] ?? null;
 
   // Tabs that were read but yielded nothing — the shape a lost month takes.
   const periodosVazios = result.periodos.filter((p) => p.clientes.size === 0);
@@ -81,37 +105,44 @@ export function AnalysisResults({ result }: Props) {
 
   return (
     <div className="space-y-6">
-      {/* KPI cards */}
+      {/* KPI cards — the current month measured against the one before it */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <KpiCard
-          title="Faturamento Atual"
+          title={`Faturamento · ${result.periodoAtual.nome}`}
           value={fmt(result.periodoAtual.totalFaturamento)}
+          subtitle={`${pct(ec.variacaoTotal)} desde ${ec.primeiro}`}
           icon={DollarSign}
-          trend={result.variacaoFaturamento}
+          trend={ultimaTransicao?.variacaoFaturamento ?? undefined}
           color="primary"
         />
         <KpiCard
-          title="Clientes Ativos"
-          value={String(result.carteira.ativos.length)}
-          subtitle={`${result.periodoAnterior.clientes.size} no período anterior`}
+          title={`Clientes · ${result.periodoAtual.nome}`}
+          value={String(result.periodoAtual.clientes.size)}
+          subtitle={`${result.periodoAnterior.clientes.size} no mês anterior · ${ec.clientesDistintos} distintos na janela`}
           icon={Users}
+          trend={ultimaTransicao?.variacaoClientes ?? undefined}
           color="primary"
         />
         <KpiCard
-          title="Clientes Novos"
-          value={String(result.carteira.novos.length)}
+          title="Entraram no mês"
+          value={String(
+            ultimaTransicao ? ultimaTransicao.novos.total + ultimaTransicao.retornados.total : 0,
+          )}
           subtitle={
-            fmt(result.carteira.faturamentoNovos) +
-            ` · sem compra nos ${janelaLabel(result)} anteriores`
+            ultimaTransicao
+              ? `${ultimaTransicao.novos.total} novos · ${ultimaTransicao.retornados.total} retornos · ${fmt(ultimaTransicao.novos.faturamento + ultimaTransicao.retornados.faturamento)}`
+              : "sem mês anterior para comparar"
           }
           icon={UserPlus}
           color="success"
         />
         <KpiCard
-          title="Clientes Perdidos"
-          value={String(result.carteira.perdidos.length)}
+          title="Saíram no mês"
+          value={String(ultimaTransicao ? ultimaTransicao.perdidos.total : 0)}
           subtitle={
-            fmt(result.carteira.faturamentoPerdidos) + " · 2+ meses sem comprar"
+            ultimaTransicao
+              ? `${fmt(ultimaTransicao.perdidos.faturamento)} deixaram de faturar · ${result.carteira.perdidos.length} há 2+ meses sem comprar`
+              : "sem mês anterior para comparar"
           }
           icon={UserMinus}
           color="destructive"
@@ -227,7 +258,10 @@ export function AnalysisResults({ result }: Props) {
 
         {/* Resumo */}
         <TabsContent value="resumo" className="space-y-6">
-          {/* Month-by-month comparison across the whole window */}
+          {/* 1 · The whole window as one movement */}
+          <EvolucaoJanela result={result} />
+
+          {/* 2 · Month against month */}
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-base">
@@ -235,6 +269,11 @@ export function AnalysisResults({ result }: Props) {
                 Comparativo mês a mês · {result.periodos.length}{" "}
                 {result.periodos.length === 1 ? "mês" : "meses"}
               </CardTitle>
+              <p className="text-xs text-muted-foreground">
+                Cada mês medido contra o mês anterior. Novos, retornados, mantidos e
+                perdidos são apurados contra todo o histórico da janela, não só contra
+                o mês anterior.
+              </p>
             </CardHeader>
             <CardContent className="space-y-6">
               <div className="overflow-x-auto">
@@ -247,8 +286,11 @@ export function AnalysisResults({ result }: Props) {
                       <TableHead className="text-right">Clientes</TableHead>
                       <TableHead className="text-right">Var. Clientes</TableHead>
                       <TableHead className="text-right">Ticket Médio</TableHead>
-                      <TableHead className="text-right">Entraram</TableHead>
-                      <TableHead className="text-right">Não compraram</TableHead>
+                      <TableHead className="text-right">Novos</TableHead>
+                      <TableHead className="text-right">Retornaram</TableHead>
+                      <TableHead className="text-right">Mantidos</TableHead>
+                      <TableHead className="text-right">Perdidos</TableHead>
+                      <TableHead className="text-right">Retenção</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -259,32 +301,38 @@ export function AnalysisResults({ result }: Props) {
                       >
                         <TableCell className="font-medium capitalize">
                           {p.nome}
+                          {i === 0 && (
+                            <span className="ml-2 text-xs text-muted-foreground">(base)</span>
+                          )}
                           {i === result.evolucaoPeriodos.length - 1 && (
                             <span className="ml-2 text-xs text-muted-foreground">(atual)</span>
                           )}
                         </TableCell>
                         <TableCell className="text-right font-medium">{fmt(p.faturamento)}</TableCell>
                         <TableCell className="text-right">
-                          {p.variacaoFaturamento === null ? (
-                            <span className="text-xs text-muted-foreground">—</span>
-                          ) : (
-                            <VariationBadge value={p.variacaoFaturamento} />
-                          )}
+                          <VariationCell value={p.variacaoFaturamento} />
                         </TableCell>
                         <TableCell className="text-right">{p.clientes}</TableCell>
                         <TableCell className="text-right">
-                          {p.variacaoClientes === null ? (
-                            <span className="text-xs text-muted-foreground">—</span>
-                          ) : (
-                            <VariationBadge value={p.variacaoClientes} />
-                          )}
+                          <VariationCell value={p.variacaoClientes} />
                         </TableCell>
                         <TableCell className="text-right">{fmt(p.ticketMedio)}</TableCell>
-                        <TableCell className="text-right text-accent">
-                          {p.entraram === null ? "—" : `+${p.entraram}`}
+                        <ContagemCell valor={p.novos} sinal="+" tom="text-accent" />
+                        <ContagemCell valor={p.retornados} sinal="+" tom="text-primary" />
+                        <TableCell className="text-right">
+                          {p.mantidos === null ? (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          ) : (
+                            p.mantidos
+                          )}
                         </TableCell>
-                        <TableCell className="text-right text-destructive">
-                          {p.sairam === null ? "—" : `−${p.sairam}`}
+                        <ContagemCell valor={p.perdidos} sinal="−" tom="text-destructive" />
+                        <TableCell className="text-right">
+                          {p.taxaRetencao === null ? (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          ) : (
+                            `${p.taxaRetencao.toFixed(0)}%`
+                          )}
                         </TableCell>
                       </TableRow>
                     ))}
@@ -292,24 +340,119 @@ export function AnalysisResults({ result }: Props) {
                 </Table>
               </div>
 
-              <ResponsiveContainer width="100%" height={260}>
-                <BarChart data={evolucaoChartData} margin={{ top: 8 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 88%)" />
-                  <XAxis dataKey="nome" tick={{ fontSize: 12 }} />
-                  <YAxis yAxisId="left" tick={{ fontSize: 11 }} />
-                  <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} />
-                  <Tooltip
-                    formatter={(v: number, n: string) => (n === "Faturamento" ? fmt(v) : v)}
-                    contentStyle={{ borderRadius: "8px", border: "1px solid hsl(220 15% 88%)" }}
-                  />
-                  <Legend />
-                  <Bar yAxisId="left" dataKey="Faturamento" fill="hsl(217 91% 50%)" radius={[4, 4, 0, 0]} />
-                  <Bar yAxisId="right" dataKey="Clientes" fill="hsl(160 60% 45%)" radius={[4, 4, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
+              <div>
+                <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Faturamento por mês
+                </p>
+                <ResponsiveContainer width="100%" height={240}>
+                  <BarChart data={faturamentoChartData} margin={{ top: 20 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 88%)" vertical={false} />
+                    <XAxis dataKey="nome" tick={{ fontSize: 12 }} tickLine={false} />
+                    {/* wide enough for "R$ 1,4 mil" to stay on one line */}
+                    <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={96}
+                      tickFormatter={(v: number) => fmtCurto(v)} />
+                    <Tooltip
+                      cursor={{ fill: "hsl(220 15% 95%)" }}
+                      formatter={(v: number) => [fmt(v), "Faturamento"]}
+                      contentStyle={{ borderRadius: "8px", border: "1px solid hsl(220 15% 88%)" }}
+                    />
+                    <Bar dataKey="Faturamento" fill="hsl(217 91% 50%)" radius={[4, 4, 0, 0]}>
+                      <LabelList
+                        dataKey="Faturamento"
+                        position="top"
+                        formatter={(v: number) => fmtCurto(v)}
+                        style={{ fontSize: 11, fill: "hsl(220 9% 46%)" }}
+                      />
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+
+              <div>
+                <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Clientes por mês
+                </p>
+                <ResponsiveContainer width="100%" height={200}>
+                  <BarChart data={faturamentoChartData} margin={{ top: 20 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 88%)" vertical={false} />
+                    <XAxis dataKey="nome" tick={{ fontSize: 12 }} tickLine={false} />
+                    <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={40} allowDecimals={false} />
+                    <Tooltip
+                      cursor={{ fill: "hsl(220 15% 95%)" }}
+                      formatter={(v: number) => [v, "Clientes"]}
+                      contentStyle={{ borderRadius: "8px", border: "1px solid hsl(220 15% 88%)" }}
+                    />
+                    <Bar dataKey="Clientes" fill="hsl(160 70% 42%)" radius={[4, 4, 0, 0]}>
+                      <LabelList
+                        dataKey="Clientes"
+                        position="top"
+                        style={{ fontSize: 11, fill: "hsl(220 9% 46%)" }}
+                      />
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
             </CardContent>
           </Card>
 
+          {/* 3 · Client movement between months */}
+          {result.transicoes.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Users className="h-4 w-4 text-primary" /> Movimentação de clientes
+                </CardTitle>
+                <p className="text-xs text-muted-foreground">
+                  Entrada e saída em cada passagem de mês. Acima do zero quem comprou;
+                  abaixo, quem deixou de comprar.
+                </p>
+              </CardHeader>
+              <CardContent>
+                <ResponsiveContainer width="100%" height={260}>
+                  <BarChart data={movimentacaoChartData} margin={{ top: 8 }} stackOffset="sign">
+                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 88%)" vertical={false} />
+                    <XAxis dataKey="nome" tick={{ fontSize: 11 }} tickLine={false} />
+                    <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={40} allowDecimals={false} />
+                    <Tooltip
+                      cursor={{ fill: "hsl(220 15% 95%)" }}
+                      formatter={(v: number, n: string) => [Math.abs(v), n]}
+                      contentStyle={{ borderRadius: "8px", border: "1px solid hsl(220 15% 88%)" }}
+                    />
+                    <Legend formatter={legendaEmTinta} />
+                    <ReferenceLine y={0} stroke="hsl(220 15% 70%)" />
+                    {/* the surface-coloured stroke leaves a 2px gap between segments */}
+                    <Bar dataKey="Mantidos" stackId="mov" fill="hsl(217 91% 50%)" stroke="hsl(0 0% 100%)" strokeWidth={2} />
+                    <Bar dataKey="Retornados" stackId="mov" fill="hsl(265 60% 55%)" stroke="hsl(0 0% 100%)" strokeWidth={2} />
+                    <Bar dataKey="Novos" stackId="mov" fill="hsl(160 70% 42%)" stroke="hsl(0 0% 100%)" strokeWidth={2} radius={[4, 4, 0, 0]} />
+                    <Bar dataKey="Perdidos" stackId="mov" fill="hsl(0 72% 51%)" stroke="hsl(0 0% 100%)" strokeWidth={2} radius={[0, 0, 4, 4]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* 4 · One card per transition, with the revenue bridge */}
+          {result.transicoes.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <TrendingUp className="h-4 w-4 text-primary" /> De um mês para o outro
+                </CardTitle>
+                <p className="text-xs text-muted-foreground">
+                  O que explica a variação de cada mês: quanto entrou com clientes novos e
+                  que retornaram, quanto os clientes mantidos cresceram ou recuaram, e
+                  quanto saiu com quem parou de comprar.
+                </p>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {result.transicoes.map((t) => (
+                  <TransicaoCard key={`${t.de}-${t.para}`} t={t} />
+                ))}
+              </CardContent>
+            </Card>
+          )}
+
+          {/* 5 · Executive summary + products */}
           <div className="grid gap-6 lg:grid-cols-2">
             <Card>
               <CardHeader>
@@ -336,31 +479,42 @@ export function AnalysisResults({ result }: Props) {
                   </div>
                 ))}
                 <Row
-                  label={`Variação total (${result.evolucaoPeriodos[0].nome} → ${result.periodoAtual.nome})`}
-                  value={`${variacaoTotal(result) >= 0 ? "+" : ""}${variacaoTotal(result).toFixed(2)}%`}
+                  label={`Variação total (${ec.primeiro} → ${ec.ultimo})`}
+                  value={pct(ec.variacaoTotal)}
                   highlight
+                />
+                <Row label="Variação média mensal" value={pct(ec.variacaoMediaMensal)} />
+                <hr className="border-border" />
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Clientes na janela
+                </p>
+                <Row label="Clientes distintos no período" value={String(ec.clientesDistintos)} />
+                <Row
+                  label={`Compraram em todos os ${ec.meses} meses`}
+                  value={String(ec.clientesRecorrentes)}
+                />
+                <Row label="Entraram ao longo do período" value={String(ec.novosNoPeriodo)} />
+                <Row label="Clientes ativos no mês atual" value={String(result.carteira.ativos.length)} />
+                <Row label="Frequência reduzida (1 mês sem comprar)" value={String(result.carteira.frequenciaReduzida.length)} />
+                <Row label="Perdidos (2+ meses sem comprar)" value={String(result.carteira.perdidos.length)} />
+                <Row
+                  label="Retenção média mês a mês"
+                  value={ec.taxaRetencaoMedia === null ? "—" : `${ec.taxaRetencaoMedia.toFixed(1)}%`}
                 />
                 <hr className="border-border" />
                 <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Carteira · janela de {result.periodos.length}{" "}
-                  {result.periodos.length === 1 ? "mês" : "meses"}
+                  Último mês · {ultimaTransicao ? `${ultimaTransicao.de} × ${ultimaTransicao.para}` : result.periodoAtual.nome}
                 </p>
-                <Row label="Clientes ativos" value={String(result.carteira.ativos.length)} />
-                <Row label="Clientes novos" value={String(result.carteira.novos.length)} />
-                <Row label="Clientes que retornaram" value={String(result.carteira.retornados.length)} />
-                <Row label="Frequência reduzida (1 mês sem comprar)" value={String(result.carteira.frequenciaReduzida.length)} />
-                <Row label="Clientes perdidos (2+ meses sem comprar)" value={String(result.carteira.perdidos.length)} />
-                <Row label="Receita de novos" value={fmt(result.carteira.faturamentoNovos)} />
-                <Row label="Receita perdida" value={fmt(result.carteira.faturamentoPerdidos)} />
-                <hr className="border-border" />
-                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Mês a mês · {result.periodoAnterior.nome} × {result.periodoAtual.nome}
-                </p>
-                <Row label="Clientes mantidos" value={String(result.clientesMantidos.length)} />
-                <Row label="Entraram no mês" value={String(result.clientesNovos.length)} />
-                <Row label="Não compraram no mês" value={String(result.clientesPerdidos.length)} />
-                <Row label="Receita de entrantes" value={fmt(result.faturamentoNovos)} />
-                <Row label="Receita não recorrente" value={fmt(result.faturamentoPerdidos)} />
+                {ultimaTransicao && (
+                  <>
+                    <Row label="Clientes mantidos" value={String(ultimaTransicao.mantidos.total)} />
+                    <Row label="Clientes novos" value={String(ultimaTransicao.novos.total)} />
+                    <Row label="Clientes que retornaram" value={String(ultimaTransicao.retornados.total)} />
+                    <Row label="Deixaram de comprar" value={String(ultimaTransicao.perdidos.total)} />
+                    <Row label="Receita que entrou" value={fmt(ultimaTransicao.novos.faturamento + ultimaTransicao.retornados.faturamento)} />
+                    <Row label="Receita que saiu" value={fmt(ultimaTransicao.perdidos.faturamento)} />
+                  </>
+                )}
               </CardContent>
             </Card>
 
@@ -369,21 +523,26 @@ export function AnalysisResults({ result }: Props) {
                 <CardTitle className="flex items-center gap-2 text-base">
                   <Package className="h-4 w-4 text-primary" /> Top 10 Produtos por Faturamento
                 </CardTitle>
+                <p className="text-xs text-muted-foreground">
+                  Uma série por mês da janela, na ordem cronológica.
+                </p>
               </CardHeader>
               <CardContent>
-                <ResponsiveContainer width="100%" height={300}>
-                  <BarChart data={chartData} margin={{ bottom: 60 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 88%)" />
-                    <XAxis dataKey="nome" angle={-35} textAnchor="end" tick={{ fontSize: 11 }} />
-                    <YAxis tick={{ fontSize: 11 }} />
+                <ResponsiveContainer width="100%" height={320}>
+                  <BarChart data={chartData} margin={{ bottom: 70 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 88%)" vertical={false} />
+                    <XAxis dataKey="nome" angle={-35} textAnchor="end" tick={{ fontSize: 11 }} interval={0} />
+                    <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} width={88}
+                      tickFormatter={(v: number) => fmtCurto(v)} />
                     <Tooltip
+                      cursor={{ fill: "hsl(220 15% 95%)" }}
                       formatter={(v: number) => fmt(v)}
                       contentStyle={{
                         borderRadius: "8px",
                         border: "1px solid hsl(220 15% 88%)",
                       }}
                     />
-                    <Legend />
+                    <Legend verticalAlign="top" height={28} formatter={legendaEmTinta} />
                     {periodNames.map((n, i) => (
                       <Bar
                         key={n}
@@ -402,30 +561,30 @@ export function AnalysisResults({ result }: Props) {
         {/* Clientes Novos */}
         <TabsContent value="novos" className="space-y-4">
           <p className="text-sm text-muted-foreground">
-            Compraram em {result.periodoAtual.nome} e em nenhum dos{" "}
-            {janelaLabel(result)} anteriores da janela.
-            {result.carteira.retornados.length > 0 && (
-              <>
-                {" "}
-                Outros {result.carteira.retornados.length} clientes voltaram a comprar
-                após um intervalo — listados abaixo, não contados como novos.
-              </>
-            )}
+            Entrada de clientes em cada passagem de mês da janela. É "novo" quem
+            comprou pela primeira vez em toda a janela; quem já havia comprado antes e
+            voltou depois de um intervalo aparece como retorno.
           </p>
+
+          <EntradaSaidaPorMes result={result} tipo="entrada" />
+
+          <h3 className="flex items-center gap-2 pt-2 text-sm font-semibold">
+            <UserPlus className="h-4 w-4 text-accent" />
+            Detalhe dos clientes novos em {result.periodoAtual.nome} (
+            {result.carteira.novos.length})
+          </h3>
           <ClientTable
             clients={result.carteira.novos}
-            emptyMessage="Nenhum cliente novo nesta janela."
+            emptyMessage={`Nenhum cliente comprou pela primeira vez em ${result.periodoAtual.nome}.`}
           />
           {result.carteira.retornados.length > 0 && (
             <>
               <h3 className="flex items-center gap-2 pt-2 text-sm font-semibold">
                 <RotateCcw className="h-4 w-4 text-primary" />
-                Clientes que retornaram ({result.carteira.retornados.length})
+                Clientes que retornaram em {result.periodoAtual.nome} (
+                {result.carteira.retornados.length})
               </h3>
-              <ClientTable
-                clients={result.carteira.retornados}
-                emptyMessage=""
-              />
+              <ClientTable clients={result.carteira.retornados} emptyMessage="" />
             </>
           )}
         </TabsContent>
@@ -433,13 +592,25 @@ export function AnalysisResults({ result }: Props) {
         {/* Clientes Perdidos */}
         <TabsContent value="perdidos" className="space-y-4">
           <p className="text-sm text-muted-foreground">
-            Sem nenhuma compra há 2 meses ou mais dentro da janela analisada. Quem
-            faltou apenas no último mês aparece como frequência reduzida (
-            {result.carteira.frequenciaReduzida.length}) na aba Carteira.
+            Saída de clientes em cada passagem de mês. Quem deixou de comprar em um mês
+            pode voltar no seguinte — a lista final é de quem está há 2 meses ou mais
+            sem comprar.
+          </p>
+
+          <EntradaSaidaPorMes result={result} tipo="saida" />
+
+          <h3 className="flex items-center gap-2 pt-2 text-sm font-semibold">
+            <UserMinus className="h-4 w-4 text-destructive" />
+            Clientes perdidos na janela ({result.carteira.perdidos.length})
+          </h3>
+          <p className="text-sm text-muted-foreground">
+            Sem nenhuma compra há 2 meses ou mais. Quem faltou apenas no último mês
+            aparece como frequência reduzida ({result.carteira.frequenciaReduzida.length})
+            na aba Carteira.
           </p>
           <CarteiraTable
             clientes={result.carteira.perdidos}
-            totalPeriodos={result.periodos.length}
+            periodos={periodNames}
             emptyMessage="Nenhum cliente perdido nesta janela."
           />
         </TabsContent>
@@ -447,8 +618,9 @@ export function AnalysisResults({ result }: Props) {
         {/* Comparativo Produtos */}
         <TabsContent value="produtos" className="space-y-4">
           <p className="text-sm text-muted-foreground">
-            Faturamento de cada produto em todos os {result.periodos.length} meses
-            analisados. As colunas de variação seguem comparando{" "}
+            Faturamento de cada produto em todos os {result.periodos.length} meses da
+            janela. A tendência e a variação do período comparam {ec.primeiro} com{" "}
+            {ec.ultimo}; as colunas de quantidade seguem comparando{" "}
             {result.periodoAnterior.nome} × {result.periodoAtual.nome}.
           </p>
           <Card>
@@ -463,7 +635,10 @@ export function AnalysisResults({ result }: Props) {
                         {n}
                       </TableHead>
                     ))}
-                    <TableHead className="text-right">Var. Valor</TableHead>
+                    <TableHead>Tendência</TableHead>
+                    <TableHead className="text-right">Var. período</TableHead>
+                    <TableHead className="text-right">Meses c/ venda</TableHead>
+                    <TableHead className="text-right">Var. mês atual</TableHead>
                     <TableHead className="text-right">Qtd Anterior</TableHead>
                     <TableHead className="text-right">Qtd Atual</TableHead>
                     <TableHead className="text-right">Var. Qtd</TableHead>
@@ -486,6 +661,15 @@ export function AnalysisResults({ result }: Props) {
                           {fmt(p.valorPorPeriodo[n] ?? 0)}
                         </TableCell>
                       ))}
+                      <TableCell>
+                        <TendenciaBadge tendencia={p.tendencia} />
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <VariationCell value={p.variacaoPeriodo} />
+                      </TableCell>
+                      <TableCell className="text-right text-muted-foreground">
+                        {p.mesesComVenda}/{result.periodos.length}
+                      </TableCell>
                       <TableCell className="text-right">
                         <VariationBadge value={p.variacaoValor} />
                       </TableCell>
@@ -502,7 +686,7 @@ export function AnalysisResults({ result }: Props) {
           </Card>
         </TabsContent>
 
-        {/* Carteira 6 Meses */}
+        {/* Carteira · janela completa */}
         <TabsContent value="carteira" className="space-y-4">
           <CarteiraAnalysis result={result} />
         </TabsContent>
@@ -715,24 +899,535 @@ export function AnalysisResults({ result }: Props) {
 // Helper components
 // ---------------------------------------------------------------------------
 
+/**
+ * Compact currency for axis ticks and bar labels: no cents, thousands folded
+ * ("R$ 550", "R$ 1,3 mil"), so ticks stay on one line and read consistently.
+ */
+function fmtCurto(v: number): string {
+  const abs = Math.abs(v);
+  if (abs >= 1_000_000)
+    return `R$ ${(v / 1_000_000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mi`;
+  if (abs >= 1_000)
+    return `R$ ${(v / 1_000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mil`;
+  return `R$ ${v.toLocaleString("pt-BR", { maximumFractionDigits: 0 })}`;
+}
+
+/** Signed percentage, or an em dash when there is no base to compare against. */
+function pct(v: number | null): string {
+  if (v === null) return "—";
+  return `${v > 0 ? "+" : ""}${v.toFixed(2)}%`;
+}
+
+const TENDENCIA_CONFIG: Record<Tendencia, { label: string; className: string; Icon: typeof TrendingUp }> = {
+  crescimento: {
+    label: "Crescimento",
+    className: "border-accent/30 bg-accent/10 text-accent",
+    Icon: TrendingUp,
+  },
+  queda: {
+    label: "Queda",
+    className: "border-destructive/30 bg-destructive/10 text-destructive",
+    Icon: TrendingDown,
+  },
+  estavel: {
+    label: "Estável",
+    className: "border-border bg-muted text-muted-foreground",
+    Icon: Minus,
+  },
+};
+
+function TendenciaBadge({ tendencia }: { tendencia: Tendencia }) {
+  const { label, className, Icon } = TENDENCIA_CONFIG[tendencia];
+  return (
+    <Badge variant="outline" className={`gap-1 ${className}`}>
+      <Icon className="h-3 w-3" />
+      {label}
+    </Badge>
+  );
+}
+
+/** Legend labels wear text ink; the colour swatch beside them carries identity. */
+const legendaEmTinta = (value: string) => (
+  <span className="text-xs text-muted-foreground">{value}</span>
+);
+
+/** A movement count: coloured when something moved, muted at zero. */
+function ContagemCell({
+  valor,
+  sinal,
+  tom,
+}: {
+  valor: number | null;
+  sinal: "+" | "−";
+  tom: string;
+}) {
+  if (valor === null) {
+    return (
+      <TableCell className="text-right">
+        <span className="text-xs text-muted-foreground">—</span>
+      </TableCell>
+    );
+  }
+  if (valor === 0) {
+    return <TableCell className="text-right text-muted-foreground">0</TableCell>;
+  }
+  return (
+    <TableCell className={`text-right font-medium ${tom}`}>
+      {sinal}
+      {valor}
+    </TableCell>
+  );
+}
+
+/** A variation cell that shows an em dash on the first month of the window. */
+function VariationCell({ value }: { value: number | null }) {
+  if (value === null) return <span className="text-xs text-muted-foreground">—</span>;
+  return <VariationBadge value={value} />;
+}
+
+/** One figure of the window, with where it started and where it ended. */
+function EvolucaoItem({
+  label,
+  de,
+  para,
+  variacao,
+}: {
+  label: string;
+  de: string;
+  para: string;
+  variacao: number | null;
+}) {
+  return (
+    <div className="rounded-lg border p-3">
+      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{label}</p>
+      <div className="mt-1 flex flex-wrap items-center gap-1.5">
+        <span className="text-sm text-muted-foreground">{de}</span>
+        <ArrowRight className="h-3 w-3 shrink-0 text-muted-foreground" />
+        <span className="text-lg font-bold text-foreground">{para}</span>
+      </div>
+      {variacao !== null && (
+        <div className="mt-1">
+          <VariationBadge value={variacao} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * What improved and what got worse across the window, read off the consolidated
+ * figures. Everything here is derived — no number is computed a second time.
+ */
+function destaques(result: AnalysisResult): { positivos: string[]; negativos: string[] } {
+  const e = result.evolucaoConsolidada;
+  const positivos: string[] = [];
+  const negativos: string[] = [];
+
+  const empurrar = (bom: boolean, texto: string) =>
+    (bom ? positivos : negativos).push(texto);
+
+  if (e.variacaoTotal !== null && Math.abs(e.variacaoTotal) >= 1) {
+    empurrar(
+      e.variacaoTotal > 0,
+      `Faturamento ${e.variacaoTotal > 0 ? "subiu" : "caiu"} ${pct(e.variacaoTotal)} de ${e.primeiro} (${fmt(e.faturamentoInicial)}) para ${e.ultimo} (${fmt(e.faturamentoFinal)}).`,
+    );
+  }
+
+  if (e.clientesFinal !== e.clientesInicial) {
+    const d = e.clientesFinal - e.clientesInicial;
+    empurrar(
+      d > 0,
+      `Base de clientes ${d > 0 ? "cresceu" : "encolheu"} de ${e.clientesInicial} para ${e.clientesFinal} clientes no mês (${d > 0 ? "+" : ""}${d}).`,
+    );
+  }
+
+  if (e.variacaoTicketMedio !== null && Math.abs(e.variacaoTicketMedio) >= 1) {
+    empurrar(
+      e.variacaoTicketMedio > 0,
+      `Ticket médio ${e.variacaoTicketMedio > 0 ? "subiu" : "caiu"} ${pct(e.variacaoTicketMedio)} (${fmt(e.ticketMedioInicial)} → ${fmt(e.ticketMedioFinal)}).`,
+    );
+  }
+
+  if (e.novosNoPeriodo > 0) {
+    positivos.push(`${e.novosNoPeriodo} cliente${e.novosNoPeriodo > 1 ? "s" : ""} comprou pela primeira vez ao longo do período.`);
+  }
+  if (e.perdidosNoPeriodo > 0) {
+    negativos.push(`${e.perdidosNoPeriodo} cliente${e.perdidosNoPeriodo > 1 ? "s" : ""} está há 2 meses ou mais sem comprar.`);
+  }
+  if (result.carteira.frequenciaReduzida.length > 0) {
+    negativos.push(`${result.carteira.frequenciaReduzida.length} cliente${result.carteira.frequenciaReduzida.length > 1 ? "s" : ""} deixou de comprar no último mês — recuperável.`);
+  }
+  if (e.clientesRecorrentes > 0) {
+    positivos.push(`${e.clientesRecorrentes} cliente${e.clientesRecorrentes > 1 ? "s" : ""} comprou em todos os ${e.meses} meses.`);
+  }
+  if (e.taxaRetencaoMedia !== null) {
+    empurrar(
+      e.taxaRetencaoMedia >= 60,
+      `Retenção média de ${e.taxaRetencaoMedia.toFixed(0)}% dos clientes de um mês para o seguinte.`,
+    );
+  }
+  if (e.mesesEmQueda > 0 && e.mesesEmAlta > 0) {
+    (e.mesesEmAlta >= e.mesesEmQueda ? positivos : negativos).push(
+      `${e.mesesEmAlta} ${e.mesesEmAlta === 1 ? "mês subiu" : "meses subiram"} e ${e.mesesEmQueda} ${e.mesesEmQueda === 1 ? "caiu" : "caíram"} dentro da janela.`,
+    );
+  }
+
+  // Products moving the most, in either direction.
+  const comHistorico = result.comparativoProdutos.filter((p) => p.variacaoPeriodo !== null);
+  const subindo = [...comHistorico].sort((a, b) => (b.variacaoPeriodo ?? 0) - (a.variacaoPeriodo ?? 0))[0];
+  const caindo = [...comHistorico].sort((a, b) => (a.variacaoPeriodo ?? 0) - (b.variacaoPeriodo ?? 0))[0];
+  if (subindo && (subindo.variacaoPeriodo ?? 0) > 5) {
+    positivos.push(`Produto em maior alta: ${subindo.produto} (${pct(subindo.variacaoPeriodo)} de ${e.primeiro} a ${e.ultimo}).`);
+  }
+  if (caindo && (caindo.variacaoPeriodo ?? 0) < -5) {
+    negativos.push(`Produto em maior queda: ${caindo.produto} (${pct(caindo.variacaoPeriodo)} de ${e.primeiro} a ${e.ultimo}).`);
+  }
+
+  return { positivos, negativos };
+}
+
+/** The headline card of the summary: the whole window read as one movement. */
+function EvolucaoJanela({ result }: { result: AnalysisResult }) {
+  const e = result.evolucaoConsolidada;
+  const { positivos, negativos } = destaques(result);
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <TrendingUp className="h-4 w-4 text-primary" />
+            Evolução da janela · {e.primeiro} → {e.ultimo}
+          </CardTitle>
+          <TendenciaBadge tendencia={e.tendencia} />
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {e.meses} {e.meses === 1 ? "mês analisado" : "meses analisados"} em sequência.
+          Os indicadores comparam o primeiro mês com o último; o total da janela aparece
+          apenas como contexto.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <EvolucaoItem
+            label="Faturamento"
+            de={fmt(e.faturamentoInicial)}
+            para={fmt(e.faturamentoFinal)}
+            variacao={e.variacaoTotal}
+          />
+          <EvolucaoItem
+            label="Clientes no mês"
+            de={String(e.clientesInicial)}
+            para={String(e.clientesFinal)}
+            variacao={e.variacaoClientes}
+          />
+          <EvolucaoItem
+            label="Ticket médio"
+            de={fmt(e.ticketMedioInicial)}
+            para={fmt(e.ticketMedioFinal)}
+            variacao={e.variacaoTicketMedio}
+          />
+          <div className="rounded-lg border p-3">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              Ritmo da janela
+            </p>
+            <p className="mt-1 text-lg font-bold text-foreground">
+              {pct(e.variacaoMediaMensal)}
+              <span className="ml-1 text-xs font-normal text-muted-foreground">por mês</span>
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {e.mesesEmAlta} {e.mesesEmAlta === 1 ? "mês em alta" : "meses em alta"} ·{" "}
+              {e.mesesEmQueda} em queda
+            </p>
+          </div>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 text-sm">
+          <div className="rounded-lg border border-dashed p-3">
+            <p className="text-xs text-muted-foreground">Melhor mês</p>
+            <p className="font-medium capitalize">{e.melhorMes.nome}</p>
+            <p className="text-xs text-muted-foreground">{fmt(e.melhorMes.faturamento)}</p>
+          </div>
+          <div className="rounded-lg border border-dashed p-3">
+            <p className="text-xs text-muted-foreground">Pior mês</p>
+            <p className="font-medium capitalize">{e.piorMes.nome}</p>
+            <p className="text-xs text-muted-foreground">{fmt(e.piorMes.faturamento)}</p>
+          </div>
+          <div className="rounded-lg border border-dashed p-3">
+            <p className="text-xs text-muted-foreground">Clientes distintos</p>
+            <p className="font-medium">{e.clientesDistintos}</p>
+            <p className="text-xs text-muted-foreground">
+              {e.clientesRecorrentes} em todos os meses
+            </p>
+          </div>
+          <div className="rounded-lg border border-dashed p-3">
+            <p className="text-xs text-muted-foreground">Total da janela</p>
+            <p className="font-medium">{fmt(e.faturamentoTotal)}</p>
+            <p className="text-xs text-muted-foreground">
+              média de {fmt(e.faturamentoMedio)}/mês
+            </p>
+          </div>
+        </div>
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="rounded-lg border border-accent/30 bg-accent/5 p-3">
+            <p className="mb-2 flex items-center gap-1.5 text-sm font-semibold text-accent">
+              <TrendingUp className="h-4 w-4" /> O que melhorou
+            </p>
+            {positivos.length > 0 ? (
+              <ul className="space-y-1.5 text-sm text-muted-foreground">
+                {positivos.map((t) => (
+                  <li key={t}>• {t}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                Nenhuma melhora relevante no período.
+              </p>
+            )}
+          </div>
+          <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3">
+            <p className="mb-2 flex items-center gap-1.5 text-sm font-semibold text-destructive">
+              <TrendingDown className="h-4 w-4" /> O que piorou
+            </p>
+            {negativos.length > 0 ? (
+              <ul className="space-y-1.5 text-sm text-muted-foreground">
+                {negativos.map((t) => (
+                  <li key={t}>• {t}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                Nenhuma piora relevante no período.
+              </p>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** One month-to-month move, with the parts that explain the revenue change. */
+function TransicaoCard({ t }: { t: TransicaoPeriodo }) {
+  const partes = [
+    { label: "Clientes novos", valor: t.ponte.novos, detalhe: `${t.novos.total} cliente(s)` },
+    { label: "Clientes que retornaram", valor: t.ponte.retornados, detalhe: `${t.retornados.total} cliente(s)` },
+    { label: "Mantidos que compraram mais", valor: t.ponte.expansao, detalhe: `${t.mantidos.total} mantido(s)` },
+    { label: "Mantidos que compraram menos", valor: t.ponte.contracao, detalhe: `${t.mantidos.total} mantido(s)` },
+    { label: "Deixaram de comprar", valor: t.ponte.perdidos, detalhe: `${t.perdidos.total} cliente(s)` },
+  ];
+
+  return (
+    <div className="rounded-lg border p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="flex items-center gap-2 text-sm font-semibold capitalize">
+          {t.de}
+          <ArrowRight className="h-3.5 w-3.5 text-muted-foreground" />
+          {t.para}
+        </p>
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-muted-foreground">{fmt(t.faturamentoDe)}</span>
+          <ArrowRight className="h-3 w-3 text-muted-foreground" />
+          <span className="font-semibold">{fmt(t.faturamentoPara)}</span>
+          <VariationCell value={t.variacaoFaturamento} />
+          <span
+            className={
+              t.diferencaFaturamento >= 0
+                ? "text-xs font-medium text-accent"
+                : "text-xs font-medium text-destructive"
+            }
+          >
+            {t.diferencaFaturamento >= 0 ? "+" : "−"}
+            {fmt(Math.abs(t.diferencaFaturamento))}
+          </span>
+        </div>
+      </div>
+
+      <div className="mt-3 grid gap-3 md:grid-cols-2">
+        <div>
+          <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Movimentação de clientes
+          </p>
+          <div className="grid grid-cols-2 gap-2 text-sm">
+            <MovItem label="Novos" valor={t.novos.total} receita={t.novos.faturamento} tom="accent" />
+            <MovItem label="Retornaram" valor={t.retornados.total} receita={t.retornados.faturamento} tom="primary" />
+            <MovItem label="Mantidos" valor={t.mantidos.total} receita={t.mantidos.faturamento} tom="neutro" />
+            <MovItem label="Perderam-se" valor={t.perdidos.total} receita={t.perdidos.faturamento} tom="destructive" />
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Retenção:{" "}
+            <span className="font-medium text-foreground">
+              {t.taxaRetencao === null ? "—" : `${t.taxaRetencao.toFixed(0)}%`}
+            </span>{" "}
+            dos {t.clientesDe} clientes de {t.de} · ticket médio {fmt(t.ticketMedioDe)} →{" "}
+            {fmt(t.ticketMedioPara)}
+          </p>
+        </div>
+
+        <div>
+          <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            O que explica a variação
+          </p>
+          <div className="space-y-1 text-sm">
+            {partes.map((parte) => (
+              <div key={parte.label} className="flex items-center justify-between gap-2">
+                <span className="text-muted-foreground">
+                  {parte.label}
+                  <span className="ml-1 text-xs opacity-70">({parte.detalhe})</span>
+                </span>
+                <span
+                  className={
+                    parte.valor > 0
+                      ? "font-medium text-accent"
+                      : parte.valor < 0
+                        ? "font-medium text-destructive"
+                        : "text-muted-foreground"
+                  }
+                >
+                  {parte.valor > 0 ? "+" : parte.valor < 0 ? "−" : ""}
+                  {fmt(Math.abs(parte.valor))}
+                </span>
+              </div>
+            ))}
+            <div className="flex items-center justify-between gap-2 border-t pt-1 font-semibold">
+              <span>Variação do mês</span>
+              <span className={t.ponte.total >= 0 ? "text-accent" : "text-destructive"}>
+                {t.ponte.total >= 0 ? "+" : "−"}
+                {fmt(Math.abs(t.ponte.total))}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Who came in (or left) at every passage of month, so entrada and saída are read
+ * as a movement across the window instead of a single month's list.
+ */
+function EntradaSaidaPorMes({
+  result,
+  tipo,
+}: {
+  result: AnalysisResult;
+  tipo: "entrada" | "saida";
+}) {
+  if (result.transicoes.length === 0) {
+    return (
+      <Card>
+        <CardContent className="py-8 text-center text-muted-foreground">
+          É preciso pelo menos dois meses para acompanhar entrada e saída de clientes.
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardContent className="overflow-x-auto p-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Passagem de mês</TableHead>
+              {tipo === "entrada" ? (
+                <>
+                  <TableHead className="text-right">Novos</TableHead>
+                  <TableHead className="text-right">Receita dos novos</TableHead>
+                  <TableHead className="text-right">Retornaram</TableHead>
+                  <TableHead className="text-right">Receita dos retornos</TableHead>
+                  <TableHead>Quem entrou</TableHead>
+                </>
+              ) : (
+                <>
+                  <TableHead className="text-right">Deixaram de comprar</TableHead>
+                  <TableHead className="text-right">Receita que saiu</TableHead>
+                  <TableHead className="text-right">Mantidos</TableHead>
+                  <TableHead className="text-right">Retenção</TableHead>
+                  <TableHead>Quem saiu</TableHead>
+                </>
+              )}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {result.transicoes.map((t) => (
+              <TableRow key={`${t.de}-${t.para}`}>
+                <TableCell className="whitespace-nowrap font-medium capitalize">
+                  {t.de} → {t.para}
+                </TableCell>
+                {tipo === "entrada" ? (
+                  <>
+                    <TableCell className="text-right font-medium text-accent">
+                      {t.novos.total}
+                    </TableCell>
+                    <TableCell className="text-right">{fmt(t.novos.faturamento)}</TableCell>
+                    <TableCell className="text-right font-medium text-primary">
+                      {t.retornados.total}
+                    </TableCell>
+                    <TableCell className="text-right">{fmt(t.retornados.faturamento)}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {[...t.novos.nomes, ...t.retornados.nomes].join(", ") || "—"}
+                    </TableCell>
+                  </>
+                ) : (
+                  <>
+                    <TableCell className="text-right font-medium text-destructive">
+                      {t.perdidos.total}
+                    </TableCell>
+                    <TableCell className="text-right">{fmt(t.perdidos.faturamento)}</TableCell>
+                    <TableCell className="text-right">{t.mantidos.total}</TableCell>
+                    <TableCell className="text-right">
+                      {t.taxaRetencao === null ? "—" : `${t.taxaRetencao.toFixed(0)}%`}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {t.perdidos.nomes.join(", ") || "—"}
+                    </TableCell>
+                  </>
+                )}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
+function MovItem({
+  label,
+  valor,
+  receita,
+  tom,
+}: {
+  label: string;
+  valor: number;
+  receita: number;
+  tom: "accent" | "primary" | "destructive" | "neutro";
+}) {
+  const cor =
+    tom === "accent"
+      ? "text-accent"
+      : tom === "primary"
+        ? "text-primary"
+        : tom === "destructive"
+          ? "text-destructive"
+          : "text-foreground";
+  return (
+    <div className="rounded-md border px-2 py-1.5">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className={`text-lg font-bold leading-tight ${cor}`}>{valor}</p>
+      <p className="text-xs text-muted-foreground">{fmt(receita)}</p>
+    </div>
+  );
+}
+
 /** Older months fade toward grey; the current month gets the strong accent. */
 function periodColor(index: number, total: number): string {
   if (index === total - 1) return "hsl(217 91% 50%)";
   const lightness = 82 - (index / Math.max(total - 1, 1)) * 22;
   return `hsl(217 25% ${lightness}%)`;
-}
-
-/** Variation between the oldest and the most recent month of the window. */
-function variacaoTotal(result: AnalysisResult): number {
-  const primeiro = result.evolucaoPeriodos[0];
-  const ultimo = result.evolucaoPeriodos[result.evolucaoPeriodos.length - 1];
-  if (!primeiro || primeiro.faturamento === 0) return 0;
-  return ((ultimo.faturamento - primeiro.faturamento) / primeiro.faturamento) * 100;
-}
-
-function janelaLabel(result: AnalysisResult): string {
-  const n = result.periodos.length - 1;
-  return n === 1 ? "1 mês" : `${n} meses`;
 }
 
 function origemPeriodoLabel(origem: AnalysisResult["periodos"][number]["origemPeriodo"]): string {
@@ -869,7 +1564,7 @@ function CarteiraAnalysis({ result }: { result: AnalysisResult }) {
 
       <CarteiraTable
         clientes={classificacaoCarteira}
-        totalPeriodos={periodos.length}
+        periodos={periodos.map((p) => p.nome)}
         emptyMessage="Nenhum cliente encontrado."
       />
     </div>
@@ -878,11 +1573,12 @@ function CarteiraAnalysis({ result }: { result: AnalysisResult }) {
 
 function CarteiraTable({
   clientes,
-  totalPeriodos,
+  periodos,
   emptyMessage,
 }: {
   clientes: ClienteCarteira[];
-  totalPeriodos: number;
+  /** Period names, oldest first — one column each */
+  periodos: string[];
   emptyMessage: string;
 }) {
   if (clientes.length === 0) {
@@ -897,16 +1593,21 @@ function CarteiraTable({
 
   return (
     <Card>
-      <CardContent className="p-0">
+      <CardContent className="overflow-x-auto p-0">
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>Cliente</TableHead>
               <TableHead>Status</TableHead>
-              <TableHead>Última Compra</TableHead>
-              <TableHead className="text-right">Meses Presente</TableHead>
-              <TableHead>Histórico</TableHead>
-              <TableHead className="text-right">Fat. Última Compra</TableHead>
+              {periodos.map((n) => (
+                <TableHead key={n} className="text-right capitalize">
+                  {n}
+                </TableHead>
+              ))}
+              <TableHead className="text-right">Meses</TableHead>
+              <TableHead>Tendência</TableHead>
+              <TableHead className="text-right">Var. período</TableHead>
+              <TableHead>Última compra</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -918,17 +1619,32 @@ function CarteiraTable({
                     {STATUS_CONFIG[c.status].label}
                   </Badge>
                 </TableCell>
-                <TableCell className="text-sm text-muted-foreground">
+                {periodos.map((n) => {
+                  const v = c.faturamentoPorPeriodo[n] ?? 0;
+                  return (
+                    <TableCell
+                      key={n}
+                      className={
+                        v > 0
+                          ? "text-right text-foreground"
+                          : "text-right text-xs text-muted-foreground"
+                      }
+                    >
+                      {v > 0 ? fmt(v) : "—"}
+                    </TableCell>
+                  );
+                })}
+                <TableCell className="text-right">
+                  {c.totalPeriodosPresente}/{periodos.length}
+                </TableCell>
+                <TableCell>
+                  <TendenciaBadge tendencia={c.tendencia} />
+                </TableCell>
+                <TableCell className="text-right">
+                  <VariationCell value={c.variacaoPeriodo} />
+                </TableCell>
+                <TableCell className="text-sm capitalize text-muted-foreground">
                   {c.ultimoPeriodo}
-                </TableCell>
-                <TableCell className="text-right">
-                  {c.totalPeriodosPresente}/{totalPeriodos}
-                </TableCell>
-                <TableCell className="text-xs text-muted-foreground">
-                  {c.periodosPresente.join(", ")}
-                </TableCell>
-                <TableCell className="text-right">
-                  {fmt(c.faturamentoUltimoPeriodo)}
                 </TableCell>
               </TableRow>
             ))}
