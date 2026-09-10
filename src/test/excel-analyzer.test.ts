@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import * as XLSX from "xlsx";
-import { analyzeWorkbook } from "../lib/excel-analyzer";
+import { analyzeWorkbook, ordenarPeriodosCronologicamente } from "../lib/excel-analyzer";
 
 /**
  * Builds a workbook in the "Vendas de produto no período" report layout,
@@ -131,5 +131,115 @@ describe("analyzeWorkbook — janela de análise da carteira", () => {
     expect(() => analyzeWorkbook(buildWorkbook({ unica: ["CLIENTE A"] }))).toThrow(
       /pelo menos 2 abas.*unica/s,
     );
+  });
+});
+
+describe("ordenarPeriodosCronologicamente", () => {
+  it("ordena abas fora de ordem pelo mês", () => {
+    expect(ordenarPeriodosCronologicamente(["agosto", "junho", "julho"])).toEqual([
+      "junho",
+      "julho",
+      "agosto",
+    ]);
+  });
+
+  it("preserva abas já cronológicas", () => {
+    expect(ordenarPeriodosCronologicamente(["junho", "julho", "agosto"])).toEqual([
+      "junho",
+      "julho",
+      "agosto",
+    ]);
+  });
+
+  it("atravessa a virada de ano sem ano explícito", () => {
+    expect(
+      ordenarPeriodosCronologicamente(["janeiro", "novembro", "dezembro"]),
+    ).toEqual(["novembro", "dezembro", "janeiro"]);
+  });
+
+  it("usa o ano quando informado", () => {
+    expect(
+      ordenarPeriodosCronologicamente(["janeiro/2026", "dezembro/2025", "novembro/2025"]),
+    ).toEqual(["novembro/2025", "dezembro/2025", "janeiro/2026"]);
+  });
+
+  it("aceita abreviações, acentos e formato numérico", () => {
+    expect(ordenarPeriodosCronologicamente(["mai", "MARÇO", "Abril"])).toEqual([
+      "MARÇO",
+      "Abril",
+      "mai",
+    ]);
+    expect(ordenarPeriodosCronologicamente(["2025-08", "2025-06", "2025-07"])).toEqual([
+      "2025-06",
+      "2025-07",
+      "2025-08",
+    ]);
+  });
+
+  it("mantém a ordem original quando alguma aba não nomeia um mês", () => {
+    const nomes = ["agosto", "Resumo", "junho"];
+    expect(ordenarPeriodosCronologicamente(nomes)).toEqual(nomes);
+  });
+});
+
+describe("carteira — semântica de janela completa", () => {
+  it("separa clientes novos de clientes que retornaram", () => {
+    const r = analyzeWorkbook(
+      buildWorkbook({
+        junho: ["ANTIGO", "SAZONAL"],
+        julho: ["ANTIGO"],
+        agosto: ["ANTIGO", "SAZONAL", "NOVO"],
+      }),
+    );
+
+    // month over month, both SAZONAL and NOVO look new
+    expect(r.clientesNovos.map((c) => c.nome).sort()).toEqual(["NOVO", "SAZONAL"]);
+    // over the window, only NOVO never bought before
+    expect(r.carteira.novos.map((c) => c.nome)).toEqual(["NOVO"]);
+    expect(r.carteira.retornados.map((c) => c.nome)).toEqual(["SAZONAL"]);
+  });
+
+  it("só considera perdido quem está 2+ meses sem comprar", () => {
+    const r = analyzeWorkbook(
+      buildWorkbook({
+        junho: ["SUMIU_CEDO", "FALTOU_UM_MES", "ATIVO"],
+        julho: ["FALTOU_UM_MES", "ATIVO"],
+        agosto: ["ATIVO"],
+      }),
+    );
+
+    // month over month lumps both absences together
+    expect(r.clientesPerdidos.map((c) => c.nome)).toEqual(["FALTOU_UM_MES"]);
+    // over the window they are told apart
+    expect(r.carteira.perdidos.map((c) => c.nome)).toEqual(["SUMIU_CEDO"]);
+    expect(r.carteira.frequenciaReduzida.map((c) => c.nome)).toEqual(["FALTOU_UM_MES"]);
+  });
+
+  it("soma a receita de novos e de perdidos coerentemente", () => {
+    const r = analyzeWorkbook(
+      buildWorkbook({
+        junho: ["PERDIDO"],
+        julho: ["ATIVO"],
+        agosto: ["ATIVO", "NOVO"],
+      }),
+    );
+    // each client in the fixture bills 20 in its period
+    expect(r.carteira.faturamentoNovos).toBe(20);
+    expect(r.carteira.faturamentoPerdidos).toBe(20);
+    expect(r.carteira.ativos.map((c) => c.nome).sort()).toEqual(["ATIVO", "NOVO"]);
+  });
+
+  it("a janela é montada pelos meses mais recentes, não pelas últimas abas", () => {
+    const r = analyzeWorkbook(
+      buildWorkbook({
+        agosto: ["A"],
+        marco: ["A"],
+        junho: ["A"],
+        julho: ["A"],
+      }),
+    );
+    expect(r.periodos.map((p) => p.nome)).toEqual(["marco", "junho", "julho", "agosto"]);
+    expect(r.periodoAtual.nome).toBe("agosto");
+    expect(r.periodoAnterior.nome).toBe("julho");
   });
 });

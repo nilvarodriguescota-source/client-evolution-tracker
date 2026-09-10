@@ -13,6 +13,8 @@ import {
   CheckCircle2,
   XCircle,
   Info,
+  CalendarRange,
+  RotateCcw,
 } from "lucide-react";
 import { KpiCard } from "./KpiCard";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -36,7 +38,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
-import type { AnalysisResult, StatusCarteira } from "@/lib/excel-analyzer";
+import type { AnalysisResult, StatusCarteira, ClienteCarteira } from "@/lib/excel-analyzer";
 import type { ValidationDiagnostic, ValidationSeverity } from "@/lib/excel-validator";
 
 interface Props {
@@ -78,26 +80,62 @@ export function AnalysisResults({ result }: Props) {
         />
         <KpiCard
           title="Clientes Ativos"
-          value={String(result.periodoAtual.clientes.size)}
+          value={String(result.carteira.ativos.length)}
           subtitle={`${result.periodoAnterior.clientes.size} no período anterior`}
           icon={Users}
           color="primary"
         />
         <KpiCard
           title="Clientes Novos"
-          value={String(result.clientesNovos.length)}
-          subtitle={fmt(result.faturamentoNovos) + " em receita"}
+          value={String(result.carteira.novos.length)}
+          subtitle={
+            fmt(result.carteira.faturamentoNovos) +
+            ` · sem compra nos ${janelaLabel(result)} anteriores`
+          }
           icon={UserPlus}
           color="success"
         />
         <KpiCard
           title="Clientes Perdidos"
-          value={String(result.clientesPerdidos.length)}
-          subtitle={fmt(result.faturamentoPerdidos) + " em receita perdida"}
+          value={String(result.carteira.perdidos.length)}
+          subtitle={
+            fmt(result.carteira.faturamentoPerdidos) + " · 2+ meses sem comprar"
+          }
           icon={UserMinus}
           color="destructive"
         />
       </div>
+
+      {/* Analysis window */}
+      <Card className="border-primary/40 bg-primary/5">
+        <CardContent className="flex flex-wrap items-center gap-x-3 gap-y-2 py-3">
+          <CalendarRange className="h-5 w-5 shrink-0 text-primary" />
+          <span className="text-sm font-medium">
+            Janela de análise da carteira: {result.periodos.length}{" "}
+            {result.periodos.length === 1 ? "mês" : "meses"}
+          </span>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {result.periodos.map((p, i) => (
+              <Badge
+                key={p.nome}
+                variant="outline"
+                className={
+                  i === result.periodos.length - 1
+                    ? "border-primary/40 bg-primary/10 text-primary"
+                    : "text-muted-foreground"
+                }
+              >
+                {p.nome}
+                {i === result.periodos.length - 1 && " (atual)"}
+              </Badge>
+            ))}
+          </div>
+          <span className="text-xs text-muted-foreground">
+            Faturamento, produtos e validação seguem comparando{" "}
+            {result.periodoAnterior.nome} × {result.periodoAtual.nome}.
+          </span>
+        </CardContent>
+      </Card>
 
       {/* Validation summary banner */}
       <Card className={vr.valid ? "border-accent/50 bg-accent/5" : "border-destructive/50 bg-destructive/5"}>
@@ -125,10 +163,10 @@ export function AnalysisResults({ result }: Props) {
         <TabsList className="w-full justify-start">
           <TabsTrigger value="resumo">Resumo</TabsTrigger>
           <TabsTrigger value="novos">
-            Clientes Novos ({result.clientesNovos.length})
+            Clientes Novos ({result.carteira.novos.length})
           </TabsTrigger>
           <TabsTrigger value="perdidos">
-            Clientes Perdidos ({result.clientesPerdidos.length})
+            Clientes Perdidos ({result.carteira.perdidos.length})
           </TabsTrigger>
           <TabsTrigger value="produtos">Comparativo Produtos</TabsTrigger>
           <TabsTrigger value="carteira">
@@ -158,11 +196,26 @@ export function AnalysisResults({ result }: Props) {
                 <Row label={`Faturamento ${result.periodoAtual.nome}`} value={fmt(result.periodoAtual.totalFaturamento)} />
                 <Row label="Variação" value={`${result.variacaoFaturamento >= 0 ? "+" : ""}${result.variacaoFaturamento.toFixed(2)}%`} highlight />
                 <hr className="border-border" />
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Carteira · janela de {result.periodos.length}{" "}
+                  {result.periodos.length === 1 ? "mês" : "meses"}
+                </p>
+                <Row label="Clientes ativos" value={String(result.carteira.ativos.length)} />
+                <Row label="Clientes novos" value={String(result.carteira.novos.length)} />
+                <Row label="Clientes que retornaram" value={String(result.carteira.retornados.length)} />
+                <Row label="Frequência reduzida (1 mês sem comprar)" value={String(result.carteira.frequenciaReduzida.length)} />
+                <Row label="Clientes perdidos (2+ meses sem comprar)" value={String(result.carteira.perdidos.length)} />
+                <Row label="Receita de novos" value={fmt(result.carteira.faturamentoNovos)} />
+                <Row label="Receita perdida" value={fmt(result.carteira.faturamentoPerdidos)} />
+                <hr className="border-border" />
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Mês a mês · {result.periodoAnterior.nome} × {result.periodoAtual.nome}
+                </p>
                 <Row label="Clientes mantidos" value={String(result.clientesMantidos.length)} />
-                <Row label="Clientes novos" value={String(result.clientesNovos.length)} />
-                <Row label="Clientes perdidos" value={String(result.clientesPerdidos.length)} />
-                <Row label="Receita de novos" value={fmt(result.faturamentoNovos)} />
-                <Row label="Receita perdida" value={fmt(result.faturamentoPerdidos)} />
+                <Row label="Entraram no mês" value={String(result.clientesNovos.length)} />
+                <Row label="Não compraram no mês" value={String(result.clientesPerdidos.length)} />
+                <Row label="Receita de entrantes" value={fmt(result.faturamentoNovos)} />
+                <Row label="Receita não recorrente" value={fmt(result.faturamentoPerdidos)} />
               </CardContent>
             </Card>
 
@@ -196,18 +249,47 @@ export function AnalysisResults({ result }: Props) {
         </TabsContent>
 
         {/* Clientes Novos */}
-        <TabsContent value="novos">
+        <TabsContent value="novos" className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Compraram em {result.periodoAtual.nome} e em nenhum dos{" "}
+            {janelaLabel(result)} anteriores da janela.
+            {result.carteira.retornados.length > 0 && (
+              <>
+                {" "}
+                Outros {result.carteira.retornados.length} clientes voltaram a comprar
+                após um intervalo — listados abaixo, não contados como novos.
+              </>
+            )}
+          </p>
           <ClientTable
-            clients={result.clientesNovos}
-            emptyMessage="Nenhum cliente novo neste período."
+            clients={result.carteira.novos}
+            emptyMessage="Nenhum cliente novo nesta janela."
           />
+          {result.carteira.retornados.length > 0 && (
+            <>
+              <h3 className="flex items-center gap-2 pt-2 text-sm font-semibold">
+                <RotateCcw className="h-4 w-4 text-primary" />
+                Clientes que retornaram ({result.carteira.retornados.length})
+              </h3>
+              <ClientTable
+                clients={result.carteira.retornados}
+                emptyMessage=""
+              />
+            </>
+          )}
         </TabsContent>
 
         {/* Clientes Perdidos */}
-        <TabsContent value="perdidos">
-          <ClientTable
-            clients={result.clientesPerdidos}
-            emptyMessage="Nenhum cliente perdido neste período."
+        <TabsContent value="perdidos" className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Sem nenhuma compra há 2 meses ou mais dentro da janela analisada. Quem
+            faltou apenas no último mês aparece como frequência reduzida (
+            {result.carteira.frequenciaReduzida.length}) na aba Carteira.
+          </p>
+          <CarteiraTable
+            clientes={result.carteira.perdidos}
+            totalPeriodos={result.periodos.length}
+            emptyMessage="Nenhum cliente perdido nesta janela."
           />
         </TabsContent>
 
@@ -407,6 +489,11 @@ export function AnalysisResults({ result }: Props) {
 // Helper components
 // ---------------------------------------------------------------------------
 
+function janelaLabel(result: AnalysisResult): string {
+  const n = result.periodos.length - 1;
+  return n === 1 ? "1 mês" : `${n} meses`;
+}
+
 function layerLabel(layer: string): string {
   const labels: Record<string, string> = {
     existence: "Existência",
@@ -528,50 +615,75 @@ function CarteiraAnalysis({ result }: { result: AnalysisResult }) {
         </CardContent>
       </Card>
 
+      <CarteiraTable
+        clientes={classificacaoCarteira}
+        totalPeriodos={periodos.length}
+        emptyMessage="Nenhum cliente encontrado."
+      />
+    </div>
+  );
+}
+
+function CarteiraTable({
+  clientes,
+  totalPeriodos,
+  emptyMessage,
+}: {
+  clientes: ClienteCarteira[];
+  totalPeriodos: number;
+  emptyMessage: string;
+}) {
+  if (clientes.length === 0) {
+    return (
       <Card>
-        <CardContent className="p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Cliente</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Último Período</TableHead>
-                <TableHead className="text-right">Meses Presente</TableHead>
-                <TableHead>Histórico</TableHead>
-                <TableHead className="text-right">Fat. Último Período</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {classificacaoCarteira.map((c) => (
-                <TableRow key={c.nome}>
-                  <TableCell className="font-medium">{c.nome}</TableCell>
-                  <TableCell>
-                    <Badge
-                      variant="outline"
-                      className={STATUS_CONFIG[c.status].className}
-                    >
-                      {STATUS_CONFIG[c.status].label}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="text-muted-foreground text-sm">
-                    {c.ultimoPeriodo}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    {c.totalPeriodosPresente}/{periodos.length}
-                  </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
-                    {c.periodosPresente.join(", ")}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    {fmt(c.faturamentoUltimoPeriodo)}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+        <CardContent className="py-12 text-center text-muted-foreground">
+          {emptyMessage}
         </CardContent>
       </Card>
-    </div>
+    );
+  }
+
+  return (
+    <Card>
+      <CardContent className="p-0">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Cliente</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Última Compra</TableHead>
+              <TableHead className="text-right">Meses Presente</TableHead>
+              <TableHead>Histórico</TableHead>
+              <TableHead className="text-right">Fat. Última Compra</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {clientes.map((c) => (
+              <TableRow key={c.nome}>
+                <TableCell className="font-medium">{c.nome}</TableCell>
+                <TableCell>
+                  <Badge variant="outline" className={STATUS_CONFIG[c.status].className}>
+                    {STATUS_CONFIG[c.status].label}
+                  </Badge>
+                </TableCell>
+                <TableCell className="text-sm text-muted-foreground">
+                  {c.ultimoPeriodo}
+                </TableCell>
+                <TableCell className="text-right">
+                  {c.totalPeriodosPresente}/{totalPeriodos}
+                </TableCell>
+                <TableCell className="text-xs text-muted-foreground">
+                  {c.periodosPresente.join(", ")}
+                </TableCell>
+                <TableCell className="text-right">
+                  {fmt(c.faturamentoUltimoPeriodo)}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
   );
 }
 
