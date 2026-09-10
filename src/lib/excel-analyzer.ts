@@ -380,10 +380,16 @@ function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
 // ---------------------------------------------------------------------------
 
 export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
-  const wb = XLSX.read(buffer, { type: "array" });
+  // NOTE: legacy .xls (CFB/BIFF8) files fail to parse when a raw ArrayBuffer is
+  // passed — SheetJS returns a single bogus "Sheet1" instead of the real tabs.
+  // Wrapping in a Uint8Array parses every sheet correctly for both .xls and .xlsx.
+  const wb = XLSX.read(new Uint8Array(buffer), { type: "array" });
 
   if (wb.SheetNames.length < 2) {
-    throw new Error("A planilha precisa ter pelo menos 2 abas (períodos).");
+    throw new Error(
+      `A planilha precisa ter pelo menos 2 abas (períodos). ` +
+        `Abas encontradas: ${wb.SheetNames.length ? wb.SheetNames.join(", ") : "nenhuma"}.`,
+    );
   }
 
   const sheetNames = wb.SheetNames;
@@ -515,12 +521,16 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   const classificacaoCarteira = classificarCarteira(periodos);
 
   // ---- Merge validation reports into one combined report ----------------------
-  const allDiagnostics = periodos.flatMap((p) => p.validationReport.diagnostics);
-  const totalChecks = periodos.reduce((s, p) => s + p.validationReport.totalChecks, 0);
-  const passedChecks = periodos.reduce((s, p) => s + p.validationReport.passedChecks, 0);
+  // Scoped to the two comparison periods only, so every already-validated number
+  // in the Validação/Alertas tabs stays exactly as it was. The extra historical
+  // periods feed the portfolio classification alone.
+  const periodosValidacao = [periodoAnterior, periodoAtual];
+  const allDiagnostics = periodosValidacao.flatMap((p) => p.validationReport.diagnostics);
+  const totalChecks = periodosValidacao.reduce((s, p) => s + p.validationReport.totalChecks, 0);
+  const passedChecks = periodosValidacao.reduce((s, p) => s + p.validationReport.passedChecks, 0);
 
   const layerSummary: Record<string, { passed: number; failed: number }> = {};
-  for (const period of periodos) {
+  for (const period of periodosValidacao) {
     for (const [layer, counts] of Object.entries(period.validationReport.layerSummary)) {
       if (!layerSummary[layer]) layerSummary[layer] = { passed: 0, failed: 0 };
       layerSummary[layer].passed += counts.passed;
