@@ -56,10 +56,18 @@ const fmt = (v: number) =>
 export function AnalysisResults({ result }: Props) {
   const [tab, setTab] = useState("resumo");
 
+  const periodNames = result.periodos.map((p) => p.nome);
+
+  // One series per month of the window instead of just anterior/atual.
   const chartData = result.comparativoProdutos.slice(0, 10).map((p) => ({
     nome: p.produto.length > 18 ? p.produto.slice(0, 16) + "…" : p.produto,
-    [result.periodoAnterior.nome]: p.valorAnterior,
-    [result.periodoAtual.nome]: p.valorAtual,
+    ...Object.fromEntries(periodNames.map((n) => [n, p.valorPorPeriodo[n] ?? 0])),
+  }));
+
+  const evolucaoChartData = result.evolucaoPeriodos.map((p) => ({
+    nome: p.nome,
+    Faturamento: p.faturamento,
+    Clientes: p.clientes,
   }));
 
   const vr = result.validationReport;
@@ -184,6 +192,89 @@ export function AnalysisResults({ result }: Props) {
 
         {/* Resumo */}
         <TabsContent value="resumo" className="space-y-6">
+          {/* Month-by-month comparison across the whole window */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <CalendarRange className="h-4 w-4 text-primary" />
+                Comparativo mês a mês · {result.periodos.length}{" "}
+                {result.periodos.length === 1 ? "mês" : "meses"}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Mês</TableHead>
+                      <TableHead className="text-right">Faturamento</TableHead>
+                      <TableHead className="text-right">Var. Faturamento</TableHead>
+                      <TableHead className="text-right">Clientes</TableHead>
+                      <TableHead className="text-right">Var. Clientes</TableHead>
+                      <TableHead className="text-right">Ticket Médio</TableHead>
+                      <TableHead className="text-right">Entraram</TableHead>
+                      <TableHead className="text-right">Não compraram</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {result.evolucaoPeriodos.map((p, i) => (
+                      <TableRow
+                        key={p.nome}
+                        className={i === result.evolucaoPeriodos.length - 1 ? "bg-primary/5" : ""}
+                      >
+                        <TableCell className="font-medium capitalize">
+                          {p.nome}
+                          {i === result.evolucaoPeriodos.length - 1 && (
+                            <span className="ml-2 text-xs text-muted-foreground">(atual)</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right font-medium">{fmt(p.faturamento)}</TableCell>
+                        <TableCell className="text-right">
+                          {p.variacaoFaturamento === null ? (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          ) : (
+                            <VariationBadge value={p.variacaoFaturamento} />
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right">{p.clientes}</TableCell>
+                        <TableCell className="text-right">
+                          {p.variacaoClientes === null ? (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          ) : (
+                            <VariationBadge value={p.variacaoClientes} />
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right">{fmt(p.ticketMedio)}</TableCell>
+                        <TableCell className="text-right text-accent">
+                          {p.entraram === null ? "—" : `+${p.entraram}`}
+                        </TableCell>
+                        <TableCell className="text-right text-destructive">
+                          {p.sairam === null ? "—" : `−${p.sairam}`}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+
+              <ResponsiveContainer width="100%" height={260}>
+                <BarChart data={evolucaoChartData} margin={{ top: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="hsl(220 15% 88%)" />
+                  <XAxis dataKey="nome" tick={{ fontSize: 12 }} />
+                  <YAxis yAxisId="left" tick={{ fontSize: 11 }} />
+                  <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11 }} />
+                  <Tooltip
+                    formatter={(v: number, n: string) => (n === "Faturamento" ? fmt(v) : v)}
+                    contentStyle={{ borderRadius: "8px", border: "1px solid hsl(220 15% 88%)" }}
+                  />
+                  <Legend />
+                  <Bar yAxisId="left" dataKey="Faturamento" fill="hsl(217 91% 50%)" radius={[4, 4, 0, 0]} />
+                  <Bar yAxisId="right" dataKey="Clientes" fill="hsl(160 60% 45%)" radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+
           <div className="grid gap-6 lg:grid-cols-2">
             <Card>
               <CardHeader>
@@ -192,9 +283,28 @@ export function AnalysisResults({ result }: Props) {
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-3 text-sm">
-                <Row label={`Faturamento ${result.periodoAnterior.nome}`} value={fmt(result.periodoAnterior.totalFaturamento)} />
-                <Row label={`Faturamento ${result.periodoAtual.nome}`} value={fmt(result.periodoAtual.totalFaturamento)} />
-                <Row label="Variação" value={`${result.variacaoFaturamento >= 0 ? "+" : ""}${result.variacaoFaturamento.toFixed(2)}%`} highlight />
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Faturamento por mês · {result.periodos.length}{" "}
+                  {result.periodos.length === 1 ? "mês" : "meses"} analisados
+                </p>
+                {result.evolucaoPeriodos.map((p) => (
+                  <div key={p.nome} className="flex items-center justify-between gap-2">
+                    <span className="capitalize text-muted-foreground">{p.nome}</span>
+                    <span className="flex items-center gap-2">
+                      <span className="font-medium text-foreground">{fmt(p.faturamento)}</span>
+                      {p.variacaoFaturamento === null ? (
+                        <Badge variant="secondary" className="text-xs">base</Badge>
+                      ) : (
+                        <VariationBadge value={p.variacaoFaturamento} />
+                      )}
+                    </span>
+                  </div>
+                ))}
+                <Row
+                  label={`Variação total (${result.evolucaoPeriodos[0].nome} → ${result.periodoAtual.nome})`}
+                  value={`${variacaoTotal(result) >= 0 ? "+" : ""}${variacaoTotal(result).toFixed(2)}%`}
+                  highlight
+                />
                 <hr className="border-border" />
                 <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                   Carteira · janela de {result.periodos.length}{" "}
@@ -239,8 +349,14 @@ export function AnalysisResults({ result }: Props) {
                       }}
                     />
                     <Legend />
-                    <Bar dataKey={result.periodoAnterior.nome} fill="hsl(220 15% 75%)" radius={[4, 4, 0, 0]} />
-                    <Bar dataKey={result.periodoAtual.nome} fill="hsl(217 91% 50%)" radius={[4, 4, 0, 0]} />
+                    {periodNames.map((n, i) => (
+                      <Bar
+                        key={n}
+                        dataKey={n}
+                        fill={periodColor(i, periodNames.length)}
+                        radius={[4, 4, 0, 0]}
+                      />
+                    ))}
                   </BarChart>
                 </ResponsiveContainer>
               </CardContent>
@@ -294,20 +410,28 @@ export function AnalysisResults({ result }: Props) {
         </TabsContent>
 
         {/* Comparativo Produtos */}
-        <TabsContent value="produtos">
+        <TabsContent value="produtos" className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Faturamento de cada produto em todos os {result.periodos.length} meses
+            analisados. As colunas de variação seguem comparando{" "}
+            {result.periodoAnterior.nome} × {result.periodoAtual.nome}.
+          </p>
           <Card>
-            <CardContent className="p-0">
+            <CardContent className="overflow-x-auto p-0">
               <Table>
                 <TableHeader>
                   <TableRow>
                     <TableHead>Produto</TableHead>
                     <TableHead>Código</TableHead>
+                    {periodNames.map((n) => (
+                      <TableHead key={n} className="text-right capitalize">
+                        {n}
+                      </TableHead>
+                    ))}
+                    <TableHead className="text-right">Var. Valor</TableHead>
                     <TableHead className="text-right">Qtd Anterior</TableHead>
                     <TableHead className="text-right">Qtd Atual</TableHead>
                     <TableHead className="text-right">Var. Qtd</TableHead>
-                    <TableHead className="text-right">Valor Anterior</TableHead>
-                    <TableHead className="text-right">Valor Atual</TableHead>
-                    <TableHead className="text-right">Var. Valor</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -315,15 +439,25 @@ export function AnalysisResults({ result }: Props) {
                     <TableRow key={p.produto}>
                       <TableCell className="font-medium">{p.produto}</TableCell>
                       <TableCell className="text-muted-foreground">{p.codigo}</TableCell>
+                      {periodNames.map((n, i) => (
+                        <TableCell
+                          key={n}
+                          className={
+                            i === periodNames.length - 1
+                              ? "text-right font-medium"
+                              : "text-right text-muted-foreground"
+                          }
+                        >
+                          {fmt(p.valorPorPeriodo[n] ?? 0)}
+                        </TableCell>
+                      ))}
+                      <TableCell className="text-right">
+                        <VariationBadge value={p.variacaoValor} />
+                      </TableCell>
                       <TableCell className="text-right">{p.qtdAnterior}</TableCell>
                       <TableCell className="text-right">{p.qtdAtual}</TableCell>
                       <TableCell className="text-right">
                         <VariationBadge value={p.variacaoQtd} />
-                      </TableCell>
-                      <TableCell className="text-right">{fmt(p.valorAnterior)}</TableCell>
-                      <TableCell className="text-right">{fmt(p.valorAtual)}</TableCell>
-                      <TableCell className="text-right">
-                        <VariationBadge value={p.variacaoValor} />
                       </TableCell>
                     </TableRow>
                   ))}
@@ -488,6 +622,21 @@ export function AnalysisResults({ result }: Props) {
 // ---------------------------------------------------------------------------
 // Helper components
 // ---------------------------------------------------------------------------
+
+/** Older months fade toward grey; the current month gets the strong accent. */
+function periodColor(index: number, total: number): string {
+  if (index === total - 1) return "hsl(217 91% 50%)";
+  const lightness = 82 - (index / Math.max(total - 1, 1)) * 22;
+  return `hsl(217 25% ${lightness}%)`;
+}
+
+/** Variation between the oldest and the most recent month of the window. */
+function variacaoTotal(result: AnalysisResult): number {
+  const primeiro = result.evolucaoPeriodos[0];
+  const ultimo = result.evolucaoPeriodos[result.evolucaoPeriodos.length - 1];
+  if (!primeiro || primeiro.faturamento === 0) return 0;
+  return ((ultimo.faturamento - primeiro.faturamento) / primeiro.faturamento) * 100;
+}
 
 function janelaLabel(result: AnalysisResult): string {
   const n = result.periodos.length - 1;
