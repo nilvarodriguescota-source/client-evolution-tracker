@@ -69,6 +69,26 @@ export interface ProductComparison {
   valorAnterior: number;
   valorAtual: number;
   variacaoValor: number;
+  /** Revenue per period name, across the whole analysis window */
+  valorPorPeriodo: Record<string, number>;
+  /** Quantity per period name, across the whole analysis window */
+  qtdPorPeriodo: Record<string, number>;
+}
+
+/** One month of the analysis window, summarised for the month-by-month comparison. */
+export interface PeriodoResumo {
+  nome: string;
+  faturamento: number;
+  clientes: number;
+  /** faturamento ÷ nº de clientes */
+  ticketMedio: number;
+  /** % vs the previous month in the window; null on the first month */
+  variacaoFaturamento: number | null;
+  variacaoClientes: number | null;
+  /** Clients billing in this month that did not bill in the previous one */
+  entraram: number | null;
+  /** Clients billing in the previous month that did not bill in this one */
+  sairam: number | null;
 }
 
 export type StatusCarteira =
@@ -127,6 +147,8 @@ export interface AnalysisResult {
   classificacaoCarteira: ClienteCarteira[];
   /** Portfolio figures computed over the whole window (drives the KPI cards) */
   carteira: CarteiraResumo;
+  /** Month-by-month comparison across the whole window, oldest first */
+  evolucaoPeriodos: PeriodoResumo[];
   /** Combined validation report from all layers */
   validationReport: ValidationReport;
 }
@@ -488,6 +510,52 @@ function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
   return result.sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
 }
 
+/** Summarises every month of the window and how each moved against the one before. */
+function resumirEvolucao(periodos: PeriodData[]): PeriodoResumo[] {
+  return periodos.map((p, i) => {
+    const ant = i > 0 ? periodos[i - 1] : null;
+    const clientes = p.clientes.size;
+
+    return {
+      nome: p.nome,
+      faturamento: p.totalFaturamento,
+      clientes,
+      ticketMedio: clientes > 0 ? preciseRound(p.totalFaturamento / clientes, 4) : 0,
+      variacaoFaturamento:
+        ant && ant.totalFaturamento > 0
+          ? preciseRound(
+              ((p.totalFaturamento - ant.totalFaturamento) / ant.totalFaturamento) * 100,
+              4,
+            )
+          : null,
+      variacaoClientes:
+        ant && ant.clientes.size > 0
+          ? preciseRound(((clientes - ant.clientes.size) / ant.clientes.size) * 100, 4)
+          : null,
+      entraram: ant
+        ? [...p.clientes.keys()].filter((n) => !ant.clientes.has(n)).length
+        : null,
+      sairam: ant
+        ? [...ant.clientes.keys()].filter((n) => !p.clientes.has(n)).length
+        : null,
+    };
+  });
+}
+
+/** Revenue/quantity per product, for one period. */
+function agregarProdutos(periodo: PeriodData): Map<string, { qtd: number; valor: number }> {
+  const m = new Map<string, { qtd: number; valor: number }>();
+  for (const c of periodo.clientes.values()) {
+    for (const p of c.produtos) {
+      const e = m.get(p.produto) ?? { qtd: 0, valor: 0 };
+      e.qtd = preciseRound(e.qtd + p.quantidade, 4);
+      e.valor = preciseRound(e.valor + p.valorTotal, 4);
+      m.set(p.produto, e);
+    }
+  }
+  return m;
+}
+
 function resumirCarteira(
   periodos: PeriodData[],
   classificacao: ClienteCarteira[],
@@ -630,11 +698,23 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     }
   }
 
+  // Per-period product totals, so the summary can chart every month of the window.
+  const produtosPorPeriodo = periodos.map(agregarProdutos);
+
   const allProducts = new Set([...produtosAnterior.keys(), ...produtosAtual.keys()]);
   const comparativoProdutos: ProductComparison[] = [];
   for (const prod of allProducts) {
     const ant = produtosAnterior.get(prod) || { qtd: 0, valor: 0, codigo: "" };
     const atu = produtosAtual.get(prod) || { qtd: 0, valor: 0, codigo: ant.codigo };
+
+    const valorPorPeriodo: Record<string, number> = {};
+    const qtdPorPeriodo: Record<string, number> = {};
+    periodos.forEach((p, i) => {
+      const e = produtosPorPeriodo[i].get(prod);
+      valorPorPeriodo[p.nome] = e?.valor ?? 0;
+      qtdPorPeriodo[p.nome] = e?.qtd ?? 0;
+    });
+
     comparativoProdutos.push({
       produto: prod,
       codigo: atu.codigo || ant.codigo,
@@ -648,6 +728,8 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
       variacaoValor: ant.valor > 0
         ? preciseRound(((atu.valor - ant.valor) / ant.valor) * 100, 4)
         : atu.valor > 0 ? 100 : 0,
+      valorPorPeriodo,
+      qtdPorPeriodo,
     });
   }
   comparativoProdutos.sort((a, b) => b.valorAtual - a.valorAtual);
@@ -682,6 +764,7 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   // ---- 6-month portfolio classification ---------------------------------------
   const classificacaoCarteira = classificarCarteira(periodos);
   const carteira = resumirCarteira(periodos, classificacaoCarteira);
+  const evolucaoPeriodos = resumirEvolucao(periodos);
 
   // ---- Merge validation reports into one combined report ----------------------
   // Scoped to the two comparison periods only, so every already-validated number
@@ -724,6 +807,7 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     inconsistencias,
     classificacaoCarteira,
     carteira,
+    evolucaoPeriodos,
     validationReport,
   };
 }

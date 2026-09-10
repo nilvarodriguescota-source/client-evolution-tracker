@@ -243,3 +243,74 @@ describe("carteira — semântica de janela completa", () => {
     expect(r.periodoAnterior.nome).toBe("julho");
   });
 });
+
+describe("evolucaoPeriodos — comparativo mês a mês", () => {
+  it("cobre todos os meses da janela, com o primeiro sem variação", () => {
+    const r = analyzeWorkbook(
+      buildWorkbook({
+        junho: ["A", "B"],
+        julho: ["A", "B", "C"],
+        agosto: ["A"],
+      }),
+    );
+
+    expect(r.evolucaoPeriodos.map((p) => p.nome)).toEqual(["junho", "julho", "agosto"]);
+
+    const [jun, jul, ago] = r.evolucaoPeriodos;
+
+    // each client in the fixture bills 20
+    expect(jun.faturamento).toBe(40);
+    expect(jul.faturamento).toBe(60);
+    expect(ago.faturamento).toBe(20);
+
+    expect(jun.variacaoFaturamento).toBeNull();
+    expect(jun.entraram).toBeNull();
+    expect(jun.sairam).toBeNull();
+
+    expect(jul.variacaoFaturamento).toBe(50);
+    expect(jul.entraram).toBe(1); // C
+    expect(jul.sairam).toBe(0);
+
+    expect(ago.variacaoFaturamento).toBeCloseTo(-66.6667, 3);
+    expect(ago.entraram).toBe(0);
+    expect(ago.sairam).toBe(2); // B, C
+  });
+
+  it("calcula ticket médio e variação de clientes por mês", () => {
+    const r = analyzeWorkbook(
+      buildWorkbook({ junho: ["A", "B"], julho: ["A", "B", "C", "D"] }),
+    );
+    const [jun, jul] = r.evolucaoPeriodos;
+
+    expect(jun.clientes).toBe(2);
+    expect(jun.ticketMedio).toBe(20);
+    expect(jun.variacaoClientes).toBeNull();
+
+    expect(jul.clientes).toBe(4);
+    expect(jul.ticketMedio).toBe(20);
+    expect(jul.variacaoClientes).toBe(100);
+  });
+
+  it("expõe o faturamento de cada produto em todos os meses", () => {
+    const r = analyzeWorkbook(
+      buildWorkbook({ junho: ["A"], julho: ["A"], agosto: ["A"] }),
+    );
+    const prod = r.comparativoProdutos[0];
+
+    expect(Object.keys(prod.valorPorPeriodo)).toEqual(["junho", "julho", "agosto"]);
+    expect(prod.valorPorPeriodo).toEqual({ junho: 20, julho: 20, agosto: 20 });
+    expect(prod.qtdPorPeriodo).toEqual({ junho: 2, julho: 2, agosto: 2 });
+    // the pre-existing anterior/atual fields keep their meaning
+    expect(prod.valorAnterior).toBe(20);
+    expect(prod.valorAtual).toBe(20);
+  });
+
+  it("zera o produto nos meses em que não houve venda", () => {
+    const r = analyzeWorkbook(
+      buildWorkbook({ junho: [], julho: ["A"], agosto: ["A"] }),
+    );
+    const prod = r.comparativoProdutos[0];
+    expect(prod.valorPorPeriodo.junho).toBe(0);
+    expect(prod.valorPorPeriodo.agosto).toBe(20);
+  });
+});
