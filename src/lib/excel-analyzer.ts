@@ -98,6 +98,72 @@ export interface ProductComparison {
   valorPorPeriodo: Record<string, number>;
   /** Quantity per period name, across the whole analysis window */
   qtdPorPeriodo: Record<string, number>;
+  /** Months of the window with any sale of this product */
+  mesesComVenda: number;
+  /** First month of the window → last, in % */
+  variacaoPeriodo: number | null;
+  /** Where the product is heading across the whole window */
+  tendencia: Tendencia;
+  /** Revenue in the whole window — context for ranking, not the analysis itself */
+  valorTotalPeriodo: number;
+}
+
+/** A set of clients moving between two consecutive months. */
+export interface GrupoClientes {
+  /** Client names, sorted */
+  nomes: string[];
+  total: number;
+  /**
+   * Revenue attached to the group: measured in the month the clients bought —
+   * the newer month for novos/retornados/mantidos, the older one for perdidos.
+   */
+  faturamento: number;
+}
+
+/**
+ * What happened between two consecutive months. One transition per pair, so a
+ * six-month file yields five of them: m1→m2, m2→m3, … m5→m6.
+ */
+export interface TransicaoPeriodo {
+  de: string;
+  para: string;
+  faturamentoDe: number;
+  faturamentoPara: number;
+  /** % change; null when the earlier month billed nothing */
+  variacaoFaturamento: number | null;
+  /** Absolute change in currency */
+  diferencaFaturamento: number;
+  clientesDe: number;
+  clientesPara: number;
+  variacaoClientes: number | null;
+  ticketMedioDe: number;
+  ticketMedioPara: number;
+  variacaoTicketMedio: number | null;
+  /** Bought in `para` and in no earlier month of the window */
+  novos: GrupoClientes;
+  /** Bought in `para`, skipped `de`, but had bought earlier in the window */
+  retornados: GrupoClientes;
+  /** Bought in both months */
+  mantidos: GrupoClientes;
+  /** Bought in `de` and not in `para` */
+  perdidos: GrupoClientes;
+  /**
+   * Where the revenue change came from. The five parts add up to
+   * `diferencaFaturamento`, so the month-over-month move is fully explained.
+   */
+  ponte: {
+    novos: number;
+    retornados: number;
+    /** Kept clients that bought more (positive) */
+    expansao: number;
+    /** Kept clients that bought less (negative) */
+    contracao: number;
+    /** Revenue the clients that stopped buying used to bring (negative) */
+    perdidos: number;
+    total: number;
+  };
+  /** mantidos ÷ clientes do mês anterior, em % */
+  taxaRetencao: number | null;
 }
 
 /** One month of the analysis window, summarised for the month-by-month comparison. */
@@ -114,6 +180,59 @@ export interface PeriodoResumo {
   entraram: number | null;
   /** Clients billing in the previous month that did not bill in this one */
   sairam: number | null;
+  /** First purchase of the whole window happened in this month */
+  novos: number | null;
+  /** Came back after skipping the previous month */
+  retornados: number | null;
+  /** Bought in this month and in the previous one */
+  mantidos: number | null;
+  /** Bought in the previous month and not in this one */
+  perdidos: number | null;
+  /** Revenue the novos brought in this month */
+  faturamentoNovos: number | null;
+  /** Revenue the perdidos had in the previous month */
+  faturamentoPerdidos: number | null;
+  taxaRetencao: number | null;
+}
+
+export type Tendencia = "crescimento" | "queda" | "estavel";
+
+/** The whole window read as one movement, for the executive summary. */
+export interface EvolucaoConsolidada {
+  meses: number;
+  primeiro: string;
+  ultimo: string;
+  faturamentoInicial: number;
+  faturamentoFinal: number;
+  /** Sum of every month — context only; the analysis stays comparative */
+  faturamentoTotal: number;
+  faturamentoMedio: number;
+  /** First month → last month, in % */
+  variacaoTotal: number | null;
+  /** Average of the month-over-month changes */
+  variacaoMediaMensal: number | null;
+  clientesInicial: number;
+  clientesFinal: number;
+  variacaoClientes: number | null;
+  ticketMedioInicial: number;
+  ticketMedioFinal: number;
+  variacaoTicketMedio: number | null;
+  melhorMes: { nome: string; faturamento: number };
+  piorMes: { nome: string; faturamento: number };
+  /** Months that grew / shrank against the month before */
+  mesesEmAlta: number;
+  mesesEmQueda: number;
+  tendencia: Tendencia;
+  /** Distinct clients seen in any month */
+  clientesDistintos: number;
+  /** Bought in every single month of the window */
+  clientesRecorrentes: number;
+  /** First purchase happened after the first month */
+  novosNoPeriodo: number;
+  /** Two or more months without buying by the end of the window */
+  perdidosNoPeriodo: number;
+  /** Average of the monthly retention rates */
+  taxaRetencaoMedia: number | null;
 }
 
 export type StatusCarteira =
@@ -130,6 +249,12 @@ export interface ClienteCarteira {
   totalPeriodosPresente: number;
   periodosPresente: string[];
   faturamentoUltimoPeriodo: number;
+  /** Revenue in every month of the window, zero where the client did not buy */
+  faturamentoPorPeriodo: Record<string, number>;
+  /** First month with a purchase → last month with a purchase */
+  variacaoPeriodo: number | null;
+  /** Where this client is heading across the window */
+  tendencia: Tendencia;
 }
 
 /**
@@ -187,6 +312,10 @@ export interface AnalysisResult {
   carteira: CarteiraResumo;
   /** Month-by-month comparison across the whole window, oldest first */
   evolucaoPeriodos: PeriodoResumo[];
+  /** One entry per pair of consecutive months: m1→m2, m2→m3, … */
+  transicoes: TransicaoPeriodo[];
+  /** The whole window read as a single movement */
+  evolucaoConsolidada: EvolucaoConsolidada;
   /** Combined validation report from all layers */
   validationReport: ValidationReport;
 }
@@ -570,6 +699,28 @@ export function ordenarPeriodosCronologicamente(names: string[]): string[] {
 // Portfolio classifier over the whole window
 // ---------------------------------------------------------------------------
 
+/**
+ * Reads a series of monthly values as a direction. A 5% dead band keeps ordinary
+ * month-to-month noise from being reported as growth or decline; a series that
+ * starts or ends at zero is a start or a stop, which is a direction either way.
+ */
+function tendenciaDaSerie(valores: number[]): { tendencia: Tendencia; variacao: number | null } {
+  // A single month is a snapshot, not a direction: there is nothing to compare
+  // it against, so it gets no trend rather than a fabricated "stable".
+  if (valores.length < 2) return { tendencia: "estavel", variacao: null };
+
+  const primeiro = valores[0] ?? 0;
+  const ultimo = valores[valores.length - 1] ?? 0;
+
+  if (primeiro === 0 && ultimo === 0) return { tendencia: "estavel", variacao: null };
+  if (primeiro === 0) return { tendencia: "crescimento", variacao: null };
+  if (ultimo === 0) return { tendencia: "queda", variacao: -100 };
+
+  const v = preciseRound(((ultimo - primeiro) / primeiro) * 100, 4);
+  if (Math.abs(v) < 5) return { tendencia: "estavel", variacao: v };
+  return { tendencia: v > 0 ? "crescimento" : "queda", variacao: v };
+}
+
 function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
   const n = periodos.length;
   const allClients = new Map<string, { indicesPresente: number[]; codigoCliente?: string }>();
@@ -600,6 +751,21 @@ function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
       status = "inativo";
     }
 
+    // Revenue in every month of the window, so the client can be read as a
+    // series instead of as a single snapshot.
+    const faturamentoPorPeriodo: Record<string, number> = {};
+    for (const p of periodos) {
+      faturamentoPorPeriodo[p.nome] = p.clientes.get(nome)?.totalGeral ?? 0;
+    }
+
+    // Measured between the client's own first and last purchase: a client that
+    // arrived in month 3 is not "growing" just because months 1-2 were zero.
+    const firstIdx = Math.min(...data.indicesPresente);
+    const serie = periodos
+      .slice(firstIdx, lastIdx + 1)
+      .map((p) => p.clientes.get(nome)?.totalGeral ?? 0);
+    const { tendencia, variacao: variacaoPeriodo } = tendenciaDaSerie(serie);
+
     result.push({
       nome,
       codigoCliente: data.codigoCliente,
@@ -608,40 +774,230 @@ function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
       totalPeriodosPresente: data.indicesPresente.length,
       periodosPresente: data.indicesPresente.map((i) => periodos[i].nome),
       faturamentoUltimoPeriodo: periodos[lastIdx].clientes.get(nome)?.totalGeral ?? 0,
+      faturamentoPorPeriodo,
+      variacaoPeriodo,
+      tendencia,
     });
   }
 
   return result.sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
 }
 
-/** Summarises every month of the window and how each moved against the one before. */
-function resumirEvolucao(periodos: PeriodData[]): PeriodoResumo[] {
+/** % change, or null when there is no base to compare against. */
+function variacao(de: number, para: number): number | null {
+  if (de === 0) return null;
+  return preciseRound(((para - de) / de) * 100, 4);
+}
+
+function ticketMedio(periodo: PeriodData): number {
+  const n = periodo.clientes.size;
+  return n > 0 ? preciseRound(periodo.totalFaturamento / n, 4) : 0;
+}
+
+function grupo(nomes: string[], faturamento: number): GrupoClientes {
+  return {
+    nomes: [...nomes].sort((a, b) => a.localeCompare(b, "pt-BR")),
+    total: nomes.length,
+    faturamento: preciseRound(faturamento, 4),
+  };
+}
+
+/**
+ * Compares each month with the one before it, over the whole window.
+ *
+ * The client groups are read against the full history, not just the pair: a
+ * client that bought in m1, skipped m2 and came back in m3 is "retornado" in the
+ * m2→m3 transition, never "novo" — which is only possible because every month of
+ * the file is available here.
+ */
+function compararPeriodos(periodos: PeriodData[]): TransicaoPeriodo[] {
+  const transicoes: TransicaoPeriodo[] = [];
+
+  for (let i = 1; i < periodos.length; i++) {
+    const de = periodos[i - 1];
+    const para = periodos[i];
+
+    // Everyone seen before the previous month — tells novo from retornado.
+    const vistoAntesDeDe = new Set<string>();
+    for (let j = 0; j < i - 1; j++) {
+      for (const nome of periodos[j].clientes.keys()) vistoAntesDeDe.add(nome);
+    }
+
+    const novos: string[] = [];
+    const retornados: string[] = [];
+    const mantidos: string[] = [];
+    const perdidos: string[] = [];
+
+    let fatNovos = 0;
+    let fatRetornados = 0;
+    let fatMantidos = 0;
+    let fatPerdidos = 0;
+    let expansao = 0;
+    let contracao = 0;
+
+    for (const [nome, cliente] of para.clientes) {
+      const anterior = de.clientes.get(nome);
+      if (anterior) {
+        mantidos.push(nome);
+        fatMantidos += cliente.totalGeral;
+        const delta = cliente.totalGeral - anterior.totalGeral;
+        if (delta >= 0) expansao += delta;
+        else contracao += delta;
+      } else if (vistoAntesDeDe.has(nome)) {
+        retornados.push(nome);
+        fatRetornados += cliente.totalGeral;
+      } else {
+        novos.push(nome);
+        fatNovos += cliente.totalGeral;
+      }
+    }
+
+    for (const [nome, cliente] of de.clientes) {
+      if (!para.clientes.has(nome)) {
+        perdidos.push(nome);
+        fatPerdidos += cliente.totalGeral;
+      }
+    }
+
+    const diferenca = preciseRound(para.totalFaturamento - de.totalFaturamento, 4);
+    const tmDe = ticketMedio(de);
+    const tmPara = ticketMedio(para);
+
+    transicoes.push({
+      de: de.nome,
+      para: para.nome,
+      faturamentoDe: de.totalFaturamento,
+      faturamentoPara: para.totalFaturamento,
+      variacaoFaturamento: variacao(de.totalFaturamento, para.totalFaturamento),
+      diferencaFaturamento: diferenca,
+      clientesDe: de.clientes.size,
+      clientesPara: para.clientes.size,
+      variacaoClientes: variacao(de.clientes.size, para.clientes.size),
+      ticketMedioDe: tmDe,
+      ticketMedioPara: tmPara,
+      variacaoTicketMedio: variacao(tmDe, tmPara),
+      novos: grupo(novos, fatNovos),
+      retornados: grupo(retornados, fatRetornados),
+      mantidos: grupo(mantidos, fatMantidos),
+      perdidos: grupo(perdidos, fatPerdidos),
+      ponte: {
+        novos: preciseRound(fatNovos, 4),
+        retornados: preciseRound(fatRetornados, 4),
+        expansao: preciseRound(expansao, 4),
+        contracao: preciseRound(contracao, 4),
+        perdidos: preciseRound(-fatPerdidos, 4),
+        total: diferenca,
+      },
+      taxaRetencao:
+        de.clientes.size > 0
+          ? preciseRound((mantidos.length / de.clientes.size) * 100, 4)
+          : null,
+    });
+  }
+
+  return transicoes;
+}
+
+/** Reads the whole window as one movement: where it started, where it ended. */
+function consolidarEvolucao(
+  periodos: PeriodData[],
+  transicoes: TransicaoPeriodo[],
+  classificacao: ClienteCarteira[],
+): EvolucaoConsolidada {
+  const primeiro = periodos[0];
+  const ultimo = periodos[periodos.length - 1];
+
+  const faturamentos = periodos.map((p) => p.totalFaturamento);
+  const faturamentoTotal = preciseSum(faturamentos);
+
+  const melhor = periodos.reduce((a, b) => (b.totalFaturamento > a.totalFaturamento ? b : a));
+  const pior = periodos.reduce((a, b) => (b.totalFaturamento < a.totalFaturamento ? b : a));
+
+  const variacoes = transicoes
+    .map((t) => t.variacaoFaturamento)
+    .filter((v): v is number => v !== null);
+  const retencoes = transicoes
+    .map((t) => t.taxaRetencao)
+    .filter((v): v is number => v !== null);
+
+  const variacaoTotal = variacao(primeiro.totalFaturamento, ultimo.totalFaturamento);
+
+  // A 5-point dead band keeps small month-to-month noise from being read as a
+  // trend in either direction.
+  let tendencia: Tendencia = "estavel";
+  if (variacaoTotal !== null && Math.abs(variacaoTotal) >= 5) {
+    tendencia = variacaoTotal > 0 ? "crescimento" : "queda";
+  }
+
+  const tmInicial = ticketMedio(primeiro);
+  const tmFinal = ticketMedio(ultimo);
+
+  return {
+    meses: periodos.length,
+    primeiro: primeiro.nome,
+    ultimo: ultimo.nome,
+    faturamentoInicial: primeiro.totalFaturamento,
+    faturamentoFinal: ultimo.totalFaturamento,
+    faturamentoTotal,
+    faturamentoMedio: preciseRound(faturamentoTotal / periodos.length, 4),
+    variacaoTotal,
+    variacaoMediaMensal: variacoes.length
+      ? preciseRound(variacoes.reduce((a, b) => a + b, 0) / variacoes.length, 4)
+      : null,
+    clientesInicial: primeiro.clientes.size,
+    clientesFinal: ultimo.clientes.size,
+    variacaoClientes: variacao(primeiro.clientes.size, ultimo.clientes.size),
+    ticketMedioInicial: tmInicial,
+    ticketMedioFinal: tmFinal,
+    variacaoTicketMedio: variacao(tmInicial, tmFinal),
+    melhorMes: { nome: melhor.nome, faturamento: melhor.totalFaturamento },
+    piorMes: { nome: pior.nome, faturamento: pior.totalFaturamento },
+    mesesEmAlta: transicoes.filter((t) => t.diferencaFaturamento > 0).length,
+    mesesEmQueda: transicoes.filter((t) => t.diferencaFaturamento < 0).length,
+    tendencia,
+    clientesDistintos: classificacao.length,
+    clientesRecorrentes: classificacao.filter((c) => c.totalPeriodosPresente === periodos.length)
+      .length,
+    novosNoPeriodo: transicoes.reduce((s, t) => s + t.novos.total, 0),
+    perdidosNoPeriodo: classificacao.filter(
+      (c) => c.status === "risco_abandono" || c.status === "inativo",
+    ).length,
+    taxaRetencaoMedia: retencoes.length
+      ? preciseRound(retencoes.reduce((a, b) => a + b, 0) / retencoes.length, 4)
+      : null,
+  };
+}
+
+/**
+ * Summarises every month of the window and how each moved against the one
+ * before, reading the movement straight off the transitions so the table and the
+ * transition cards can never disagree.
+ */
+function resumirEvolucao(
+  periodos: PeriodData[],
+  transicoes: TransicaoPeriodo[],
+): PeriodoResumo[] {
   return periodos.map((p, i) => {
-    const ant = i > 0 ? periodos[i - 1] : null;
-    const clientes = p.clientes.size;
+    // transicoes[i - 1] is the move that ends in this month; the first month of
+    // the window has nothing before it to compare against.
+    const t = i > 0 ? transicoes[i - 1] : null;
 
     return {
       nome: p.nome,
       faturamento: p.totalFaturamento,
-      clientes,
-      ticketMedio: clientes > 0 ? preciseRound(p.totalFaturamento / clientes, 4) : 0,
-      variacaoFaturamento:
-        ant && ant.totalFaturamento > 0
-          ? preciseRound(
-              ((p.totalFaturamento - ant.totalFaturamento) / ant.totalFaturamento) * 100,
-              4,
-            )
-          : null,
-      variacaoClientes:
-        ant && ant.clientes.size > 0
-          ? preciseRound(((clientes - ant.clientes.size) / ant.clientes.size) * 100, 4)
-          : null,
-      entraram: ant
-        ? [...p.clientes.keys()].filter((n) => !ant.clientes.has(n)).length
-        : null,
-      sairam: ant
-        ? [...ant.clientes.keys()].filter((n) => !p.clientes.has(n)).length
-        : null,
+      clientes: p.clientes.size,
+      ticketMedio: ticketMedio(p),
+      variacaoFaturamento: t ? t.variacaoFaturamento : null,
+      variacaoClientes: t ? t.variacaoClientes : null,
+      entraram: t ? t.novos.total + t.retornados.total : null,
+      sairam: t ? t.perdidos.total : null,
+      novos: t ? t.novos.total : null,
+      retornados: t ? t.retornados.total : null,
+      mantidos: t ? t.mantidos.total : null,
+      perdidos: t ? t.perdidos.total : null,
+      faturamentoNovos: t ? t.novos.faturamento : null,
+      faturamentoPerdidos: t ? t.perdidos.faturamento : null,
+      taxaRetencao: t ? t.taxaRetencao : null,
     };
   });
 }
@@ -824,9 +1180,16 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
       if (!codigo && e?.codigo) codigo = e.codigo;
     });
 
+    const serie = periodos.map((p) => valorPorPeriodo[p.nome]);
+    const { tendencia, variacao: variacaoPeriodo } = tendenciaDaSerie(serie);
+
     comparativoProdutos.push({
       produto: prod,
       codigo,
+      mesesComVenda: serie.filter((v) => v > 0).length,
+      variacaoPeriodo,
+      tendencia,
+      valorTotalPeriodo: preciseSum(serie),
       qtdAnterior: ant.qtd,
       qtdAtual: atu.qtd,
       variacaoQtd: ant.qtd > 0
@@ -875,7 +1238,11 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   // ---- Portfolio classification over the whole window --------------------------
   const classificacaoCarteira = classificarCarteira(periodos);
   const carteira = resumirCarteira(periodos, classificacaoCarteira);
-  const evolucaoPeriodos = resumirEvolucao(periodos);
+  // Month against month first; the per-month summary and the window view are
+  // both derived from it, so every number on screen tells the same story.
+  const transicoes = compararPeriodos(periodos);
+  const evolucaoPeriodos = resumirEvolucao(periodos, transicoes);
+  const evolucaoConsolidada = consolidarEvolucao(periodos, transicoes, classificacaoCarteira);
 
   // ---- Merge validation reports into one combined report ----------------------
   // Covers every period read from the file: a month left out of the validation
@@ -937,6 +1304,8 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     classificacaoCarteira,
     carteira,
     evolucaoPeriodos,
+    transicoes,
+    evolucaoConsolidada,
     validationReport,
   };
 }
