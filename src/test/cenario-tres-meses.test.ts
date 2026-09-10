@@ -1,7 +1,15 @@
 import { describe, it, expect } from "vitest";
-import { analyzeWorkbook } from "../lib/excel-analyzer";
+import { analyzeWorkbook, type PeriodData } from "../lib/excel-analyzer";
 import * as XLSX from "xlsx";
 import { abaRelatorio, montarArquivo, type AbaFixture, type Rows } from "./relatorio-fixture";
+
+/**
+ * Clients are keyed by identity (the report's client code), so the tests look
+ * them up by the name a person would read on screen.
+ */
+function porNome(periodo: PeriodData, nome: string) {
+  return [...periodo.clientes.values()].find((c) => c.nome === nome);
+}
 
 /** A file whose first tab is written by hand, followed by regular report tabs. */
 function comAbaCrua(nome: string, rows: Rows, resto: Record<string, AbaFixture>): ArrayBuffer {
@@ -93,7 +101,7 @@ describe("cenário real · junho + julho + agosto", () => {
     ]);
 
     // junho's rows, down to the individual product
-    const alfaJunho = r.periodos[0].clientes.get("CLIENTE ALFA")!;
+    const alfaJunho = porNome(r.periodos[0], "CLIENTE ALFA")!;
     expect(alfaJunho.codigoCliente).toBe("1001");
     expect(alfaJunho.produtos.map((p) => p.produto)).toEqual(["PARAFUSO", "PORCA"]);
     expect(alfaJunho.produtos[0].quantidade).toBe(10);
@@ -206,7 +214,7 @@ describe("cenário real · junho + julho + agosto", () => {
 
     expect(r.periodos.map((p) => p.nome)).toEqual(["junho", "julho", "agosto"]);
     expect(r.periodos[0].totalFaturamento).toBe(TOTAL_JUNHO);
-    expect(r.periodos[0].clientes.get("CLIENTE BETA")!.produtos.map((p) => p.produto)).toEqual([
+    expect(porNome(r.periodos[0], "CLIENTE BETA")!.produtos.map((p) => p.produto)).toEqual([
       "ARRUELA",
       "GRAXA",
     ]);
@@ -265,7 +273,7 @@ describe("cenário real · junho + julho + agosto", () => {
       ),
     );
 
-    const alfa = r.periodos[0].clientes.get("CLIENTE ALFA")!;
+    const alfa = porNome(r.periodos[0], "CLIENTE ALFA")!;
     expect(alfa.produtos.map((p) => p.produto)).toEqual(["PARAFUSO", "PORCA"]);
     expect(r.periodos[0].totalFaturamento).toBe(45);
     // the per-unit totals row is not read as a nameless product
@@ -291,7 +299,7 @@ describe("cenário real · junho + julho + agosto", () => {
       ),
     );
 
-    const alfa = r.periodos[0].clientes.get("CLIENTE ALFA")!;
+    const alfa = porNome(r.periodos[0], "CLIENTE ALFA")!;
     // neither block is dropped, and the reported total is the sum of both
     expect(alfa.produtos.map((p) => p.produto)).toEqual(["PARAFUSO", "PORCA"]);
     expect(alfa.totalGeral).toBe(45);

@@ -25,6 +25,12 @@ export interface ClienteFixture {
   itens: ItemFixture[];
   /** Subtotal as printed; defaults to the sum of the items */
   subtotal?: number;
+  /** Appended to the client line as "- Data da última compra: …" */
+  dataUltimaCompra?: string;
+  /** Appended as "- Fone: …" */
+  fone?: string;
+  /** Appended as "- Celular: …" */
+  celular?: string;
 }
 
 export interface AbaFixture {
@@ -58,7 +64,13 @@ export function abaRelatorio(aba: AbaFixture): Rows {
   rows.push([]);
 
   for (const cliente of aba.clientes) {
-    const sufixo = aba.intervalo ? ` - Data: ${aba.intervalo}` : "";
+    // The exports append labelled fields to the client line, in this order.
+    const partes = [aba.intervalo ? `Data: ${aba.intervalo}` : ""];
+    if (cliente.dataUltimaCompra) partes.push(`Data da última compra: ${cliente.dataUltimaCompra}`);
+    if (cliente.fone) partes.push(`Fone: ${cliente.fone}`);
+    if (cliente.celular) partes.push(`Celular: ${cliente.celular}`);
+    const sufixo = partes.filter(Boolean).map((p) => ` - ${p}`).join("");
+
     rows.push(pad([`Cliente: ${cliente.codigo} - ${cliente.nome}${sufixo}`]));
     rows.push(pad(aba.cabecalhoDeProdutos ?? CABECALHO_PADRAO));
 

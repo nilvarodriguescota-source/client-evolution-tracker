@@ -45,9 +45,11 @@ import {
 } from "recharts";
 import type {
   AnalysisResult,
+  ClientData,
   StatusCarteira,
   ClienteCarteira,
   TransicaoPeriodo,
+  ClienteMovimento,
   Tendencia,
 } from "@/lib/excel-analyzer";
 import type { ValidationDiagnostic, ValidationSeverity } from "@/lib/excel-validator";
@@ -1305,8 +1307,11 @@ function TransicaoCard({ t }: { t: TransicaoPeriodo }) {
 }
 
 /**
- * Who came in (or left) at every passage of month, so entrada and saída are read
- * as a movement across the window instead of a single month's list.
+ * Entrada or saída of clients at every passage of month.
+ *
+ * Each month gets a summary line and then one row per client — name, last
+ * purchase date, revenue and classification in their own columns — instead of
+ * every client packed into a single cell of running text.
  */
 function EntradaSaidaPorMes({
   result,
@@ -1326,72 +1331,154 @@ function EntradaSaidaPorMes({
   }
 
   return (
+    <div className="space-y-4">
+      {result.transicoes.map((t) => (
+        <PassagemDeMes key={`${t.de}-${t.para}`} t={t} tipo={tipo} />
+      ))}
+    </div>
+  );
+}
+
+/** One passage of month: the totals, then the clients behind them. */
+function PassagemDeMes({ t, tipo }: { t: TransicaoPeriodo; tipo: "entrada" | "saida" }) {
+  // Novos and retornados are listed together, each keeping its classification —
+  // the operational question is "who bought this month that did not last month".
+  const linhas: { cliente: ClienteMovimento; classe: "Novo" | "Retorno" | "Saiu" }[] =
+    tipo === "entrada"
+      ? [
+          ...t.novos.clientes.map((c) => ({ cliente: c, classe: "Novo" as const })),
+          ...t.retornados.clientes.map((c) => ({ cliente: c, classe: "Retorno" as const })),
+        ].sort((a, b) => a.cliente.nome.localeCompare(b.cliente.nome, "pt-BR"))
+      : t.perdidos.clientes.map((c) => ({ cliente: c, classe: "Saiu" as const }));
+
+  const temContato = linhas.some(({ cliente }) => cliente.fone || cliente.celular);
+
+  return (
     <Card>
-      <CardContent className="overflow-x-auto p-0">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Passagem de mês</TableHead>
-              {tipo === "entrada" ? (
-                <>
-                  <TableHead className="text-right">Novos</TableHead>
-                  <TableHead className="text-right">Receita dos novos</TableHead>
-                  <TableHead className="text-right">Retornaram</TableHead>
-                  <TableHead className="text-right">Receita dos retornos</TableHead>
-                  <TableHead>Quem entrou</TableHead>
-                </>
-              ) : (
-                <>
-                  <TableHead className="text-right">Deixaram de comprar</TableHead>
-                  <TableHead className="text-right">Receita que saiu</TableHead>
-                  <TableHead className="text-right">Mantidos</TableHead>
-                  <TableHead className="text-right">Retenção</TableHead>
-                  <TableHead>Quem saiu</TableHead>
-                </>
-              )}
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {result.transicoes.map((t) => (
-              <TableRow key={`${t.de}-${t.para}`}>
-                <TableCell className="whitespace-nowrap font-medium capitalize">
-                  {t.de} → {t.para}
-                </TableCell>
-                {tipo === "entrada" ? (
-                  <>
-                    <TableCell className="text-right font-medium text-accent">
-                      {t.novos.total}
+      <CardHeader className="pb-3">
+        <CardTitle className="flex items-center gap-2 text-base capitalize">
+          <CalendarRange className="h-4 w-4 text-primary" />
+          {t.de}
+          <ArrowRight className="h-3.5 w-3.5 text-muted-foreground" />
+          {t.para}
+        </CardTitle>
+        <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm">
+          {tipo === "entrada" ? (
+            <>
+              <Resumo rotulo="Novos" valor={t.novos.total} tom="text-accent" />
+              <Resumo rotulo="Receita dos novos" valor={fmt(t.novos.faturamento)} />
+              <Resumo rotulo="Retornaram" valor={t.retornados.total} tom="text-primary" />
+              <Resumo rotulo="Receita dos retornos" valor={fmt(t.retornados.faturamento)} />
+            </>
+          ) : (
+            <>
+              <Resumo rotulo="Deixaram de comprar" valor={t.perdidos.total} tom="text-destructive" />
+              <Resumo rotulo="Receita que saiu" valor={fmt(t.perdidos.faturamento)} />
+              <Resumo rotulo="Mantidos" valor={t.mantidos.total} />
+              <Resumo
+                rotulo="Retenção"
+                valor={t.taxaRetencao === null ? "—" : `${t.taxaRetencao.toFixed(0)}%`}
+              />
+            </>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="p-0">
+        {linhas.length === 0 ? (
+          <p className="px-6 pb-5 text-sm text-muted-foreground">
+            {tipo === "entrada"
+              ? `Nenhum cliente entrou em ${t.para}.`
+              : `Nenhum cliente deixou de comprar em ${t.para}.`}
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Cliente</TableHead>
+                  <TableHead>Data da última compra</TableHead>
+                  <TableHead>Código</TableHead>
+                  <TableHead className="text-right">
+                    {tipo === "entrada" ? `Receita em ${t.para}` : `Receita em ${t.de}`}
+                  </TableHead>
+                  {tipo === "entrada" && <TableHead>Classificação</TableHead>}
+                  {temContato && <TableHead>Fone</TableHead>}
+                  {temContato && <TableHead>Celular</TableHead>}
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {linhas.map(({ cliente, classe }) => (
+                  <TableRow key={cliente.chave}>
+                    <TableCell className="font-medium">{cliente.nome}</TableCell>
+                    <TableCell className="whitespace-nowrap">
+                      {cliente.dataUltimaCompra ?? (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      )}
                     </TableCell>
-                    <TableCell className="text-right">{fmt(t.novos.faturamento)}</TableCell>
-                    <TableCell className="text-right font-medium text-primary">
-                      {t.retornados.total}
+                    <TableCell className="text-muted-foreground">
+                      {cliente.codigoCliente ?? "—"}
                     </TableCell>
-                    <TableCell className="text-right">{fmt(t.retornados.faturamento)}</TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
-                      {[...t.novos.nomes, ...t.retornados.nomes].join(", ") || "—"}
-                    </TableCell>
-                  </>
-                ) : (
-                  <>
-                    <TableCell className="text-right font-medium text-destructive">
-                      {t.perdidos.total}
-                    </TableCell>
-                    <TableCell className="text-right">{fmt(t.perdidos.faturamento)}</TableCell>
-                    <TableCell className="text-right">{t.mantidos.total}</TableCell>
-                    <TableCell className="text-right">
-                      {t.taxaRetencao === null ? "—" : `${t.taxaRetencao.toFixed(0)}%`}
-                    </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
-                      {t.perdidos.nomes.join(", ") || "—"}
-                    </TableCell>
-                  </>
-                )}
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+                    <TableCell className="text-right">{fmt(cliente.faturamento)}</TableCell>
+                    {tipo === "entrada" && (
+                      <TableCell>
+                        <Badge
+                          variant="outline"
+                          className={
+                            classe === "Novo"
+                              ? "border-accent/30 bg-accent/10 text-accent"
+                              : "border-primary/30 bg-primary/10 text-primary"
+                          }
+                        >
+                          {classe}
+                        </Badge>
+                      </TableCell>
+                    )}
+                    {temContato && (
+                      <TableCell className="whitespace-nowrap text-muted-foreground">
+                        {cliente.fone ?? "—"}
+                      </TableCell>
+                    )}
+                    {temContato && (
+                      <TableCell className="whitespace-nowrap text-muted-foreground">
+                        {cliente.celular ?? "—"}
+                      </TableCell>
+                    )}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
       </CardContent>
     </Card>
+  );
+}
+
+/** One labelled field of a client, kept apart from the client's name. */
+function CampoCliente({ rotulo, valor }: { rotulo: string; valor: string }) {
+  return (
+    <span className="flex items-baseline gap-1">
+      <span className="uppercase tracking-wide text-muted-foreground">{rotulo}</span>
+      <span className="font-medium text-foreground">{valor}</span>
+    </span>
+  );
+}
+
+/** A labelled figure in the header of a passage card. */
+function Resumo({
+  rotulo,
+  valor,
+  tom,
+}: {
+  rotulo: string;
+  valor: string | number;
+  tom?: string;
+}) {
+  return (
+    <span className="flex items-baseline gap-1.5">
+      <span className="text-xs uppercase tracking-wide text-muted-foreground">{rotulo}</span>
+      <span className={`font-semibold ${tom ?? "text-foreground"}`}>{valor}</span>
+    </span>
   );
 }
 
@@ -1598,6 +1685,8 @@ function CarteiraTable({
           <TableHeader>
             <TableRow>
               <TableHead>Cliente</TableHead>
+              <TableHead>Data da última compra</TableHead>
+              <TableHead>Código</TableHead>
               <TableHead>Status</TableHead>
               {periodos.map((n) => (
                 <TableHead key={n} className="text-right capitalize">
@@ -1607,13 +1696,21 @@ function CarteiraTable({
               <TableHead className="text-right">Meses</TableHead>
               <TableHead>Tendência</TableHead>
               <TableHead className="text-right">Var. período</TableHead>
-              <TableHead>Última compra</TableHead>
+              <TableHead>Último mês com compra</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {clientes.map((c) => (
-              <TableRow key={c.nome}>
+              <TableRow key={c.chave}>
                 <TableCell className="font-medium">{c.nome}</TableCell>
+                <TableCell className="whitespace-nowrap">
+                  {c.dataUltimaCompra ?? (
+                    <span className="text-xs text-muted-foreground">—</span>
+                  )}
+                </TableCell>
+                <TableCell className="text-muted-foreground">
+                  {c.codigoCliente ?? "—"}
+                </TableCell>
                 <TableCell>
                   <Badge variant="outline" className={STATUS_CONFIG[c.status].className}>
                     {STATUS_CONFIG[c.status].label}
@@ -1659,7 +1756,7 @@ function ClientTable({
   clients,
   emptyMessage,
 }: {
-  clients: { nome: string; codigoCliente?: string; produtos: { produto: string; codigo: string; unidade?: string; quantidade: number; valorTotal: number }[]; totalGeral: number }[];
+  clients: ClientData[];
   emptyMessage: string;
 }) {
   if (clients.length === 0) {
@@ -1675,13 +1772,22 @@ function ClientTable({
   return (
     <div className="space-y-4">
       {clients.map((c) => (
-        <Card key={c.nome}>
+        <Card key={c.chave}>
           <CardHeader className="pb-2">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <CardTitle className="text-base">{c.nome}</CardTitle>
               <Badge variant="secondary" className="text-sm font-semibold">
                 {fmt(c.totalGeral)}
               </Badge>
+            </div>
+            {/* the report's own fields, each labelled — never appended to the name */}
+            <div className="flex flex-wrap gap-x-5 gap-y-1 pt-1 text-xs">
+              {c.codigoCliente && <CampoCliente rotulo="Código" valor={c.codigoCliente} />}
+              {c.dataUltimaCompra && (
+                <CampoCliente rotulo="Data da última compra" valor={c.dataUltimaCompra} />
+              )}
+              {c.fone && <CampoCliente rotulo="Fone" valor={c.fone} />}
+              {c.celular && <CampoCliente rotulo="Celular" valor={c.celular} />}
             </div>
           </CardHeader>
           <CardContent className="p-0">

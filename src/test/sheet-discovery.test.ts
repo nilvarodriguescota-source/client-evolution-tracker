@@ -34,12 +34,12 @@ describe("lerCabecalhoCliente", () => {
     ];
 
     for (const [texto, codigo, nome] of casos) {
-      expect(lerCabecalhoCliente([texto]), texto).toEqual({ codigo, nome, coluna: 0 });
+      expect(lerCabecalhoCliente([texto]), texto).toMatchObject({ codigo, nome, coluna: 0 });
     }
   });
 
   it("encontra o cabeçalho em qualquer coluna", () => {
-    expect(lerCabecalhoCliente([null, null, "Cliente: 7 - BETA"])).toEqual({
+    expect(lerCabecalhoCliente([null, null, "Cliente: 7 - BETA"])).toMatchObject({
       codigo: "7",
       nome: "BETA",
       coluna: 2,
