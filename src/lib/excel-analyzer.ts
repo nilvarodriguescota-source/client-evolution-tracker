@@ -87,6 +87,29 @@ export interface ClienteCarteira {
   faturamentoUltimoPeriodo: number;
 }
 
+/**
+ * Client portfolio read over the whole analysis window (up to 6 months), as
+ * opposed to the strict month-over-month comparison kept in AnalysisResult.
+ */
+export interface CarteiraResumo {
+  /** Period names in the window, oldest first */
+  periodos: string[];
+  /** Clients that bought in the current period */
+  ativos: ClientData[];
+  /** Bought now and in no earlier period of the window — genuinely new */
+  novos: ClientData[];
+  /** Bought now, absent from the previous period, but present earlier — came back */
+  retornados: ClientData[];
+  /** Absent from the current period only (last purchase one period ago) */
+  frequenciaReduzida: ClienteCarteira[];
+  /** No purchase for two or more periods — effectively out of the portfolio */
+  perdidos: ClienteCarteira[];
+  /** Revenue of `novos` in the current period */
+  faturamentoNovos: number;
+  /** Revenue of `perdidos`, measured in each one's last active period */
+  faturamentoPerdidos: number;
+}
+
 export interface AnalysisResult {
   periodoAnterior: PeriodData;
   periodoAtual: PeriodData;
@@ -102,6 +125,8 @@ export interface AnalysisResult {
   inconsistencias: string[];
   /** 6-month portfolio classification for every client found in any period */
   classificacaoCarteira: ClienteCarteira[];
+  /** Portfolio figures computed over the whole window (drives the KPI cards) */
+  carteira: CarteiraResumo;
   /** Combined validation report from all layers */
   validationReport: ValidationReport;
 }
@@ -122,6 +147,9 @@ const COL = {
   PRECO_MEDIO: 4,
   VENDA_BRUTA: 5,
 } as const;
+
+/** Maximum number of monthly sheets considered by the portfolio analysis */
+export const MAX_PERIODOS_CARTEIRA = 6;
 
 /** Tolerance for math checks (in currency units) */
 const MATH_TOLERANCE = 0.01;
@@ -328,6 +356,91 @@ function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
 }
 
 // ---------------------------------------------------------------------------
+// Chronological ordering of period sheets
+// ---------------------------------------------------------------------------
+
+const MESES: Record<string, number> = {
+  janeiro: 1, jan: 1,
+  fevereiro: 2, fev: 2,
+  marco: 3, mar: 3,
+  abril: 4, abr: 4,
+  maio: 5, mai: 5,
+  junho: 6, jun: 6,
+  julho: 7, jul: 7,
+  agosto: 8, ago: 8,
+  setembro: 9, set: 9, sep: 9,
+  outubro: 10, out: 10,
+  novembro: 11, nov: 11,
+  dezembro: 12, dez: 12,
+};
+
+interface SheetPeriod {
+  name: string;
+  index: number;
+  month?: number;
+  year?: number;
+}
+
+/** Extracts month/year from a sheet name ("junho", "junho/2025", "06/2025", "2025-06"). */
+function parseSheetPeriod(name: string, index: number): SheetPeriod {
+  const norm = name
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, ""); // "março" -> "marco"
+
+  let m = norm.match(/^(\d{4})[-/.](\d{1,2})$/);
+  if (m) return { name, index, year: Number(m[1]), month: Number(m[2]) };
+
+  m = norm.match(/^(\d{1,2})[-/.](\d{4})$/);
+  if (m) return { name, index, month: Number(m[1]), year: Number(m[2]) };
+
+  const month = (norm.match(/[a-z]+/g) ?? [])
+    .map((w) => MESES[w])
+    .find((v) => v !== undefined);
+  const yearMatch = norm.match(/\b(\d{4})\b/);
+
+  return { name, index, month, year: yearMatch ? Number(yearMatch[1]) : undefined };
+}
+
+/**
+ * Orders period sheets chronologically so the analysis window does not depend on
+ * the order the tabs happen to be saved in. Sheet names that don't name a
+ * recognizable month are left in workbook order (nothing reliable to sort by).
+ */
+export function ordenarPeriodosCronologicamente(names: string[]): string[] {
+  const parsed = names.map(parseSheetPeriod);
+
+  if (parsed.some((p) => p.month === undefined)) return names;
+
+  // Explicit years on every sheet: a plain (year, month) sort is unambiguous.
+  if (parsed.every((p) => p.year !== undefined)) {
+    return [...parsed]
+      .sort((a, b) => a.year! - b.year! || a.month! - b.month! || a.index - b.index)
+      .map((p) => p.name);
+  }
+
+  // No years: pick the 12-month rotation that packs the months into the
+  // shortest span, so novembro → dezembro → janeiro sorts across the year end
+  // instead of collapsing to janeiro → novembro → dezembro.
+  const meses = [...new Set(parsed.map((p) => p.month!))];
+  let inicio = meses[0];
+  let menorSpan = Infinity;
+  for (const s of meses) {
+    const span = Math.max(...meses.map((m) => (m - s + 12) % 12));
+    if (span < menorSpan) {
+      menorSpan = span;
+      inicio = s;
+    }
+  }
+  const rank = (m: number) => (m - inicio + 12) % 12;
+
+  return [...parsed]
+    .sort((a, b) => rank(a.month!) - rank(b.month!) || a.index - b.index)
+    .map((p) => p.name);
+}
+
+// ---------------------------------------------------------------------------
 // 6-month portfolio classifier
 // ---------------------------------------------------------------------------
 
@@ -375,6 +488,54 @@ function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
   return result.sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
 }
 
+function resumirCarteira(
+  periodos: PeriodData[],
+  classificacao: ClienteCarteira[],
+): CarteiraResumo {
+  const atual = periodos[periodos.length - 1];
+  const anterior = periodos[periodos.length - 2];
+  const anteriores = periodos.slice(0, -1);
+
+  const vistoAntes = new Set<string>();
+  for (const p of anteriores) for (const nome of p.clientes.keys()) vistoAntes.add(nome);
+
+  const ativos: ClientData[] = [];
+  const novos: ClientData[] = [];
+  const retornados: ClientData[] = [];
+
+  for (const [nome, cliente] of atual.clientes) {
+    ativos.push(cliente);
+    if (!vistoAntes.has(nome)) {
+      novos.push(cliente);
+    } else if (!anterior.clientes.has(nome)) {
+      // Skipped last month but bought before — a longer buying cycle, not a new client.
+      retornados.push(cliente);
+    }
+  }
+
+  const frequenciaReduzida = classificacao.filter((c) => c.status === "frequencia_reduzida");
+  const perdidos = classificacao.filter(
+    (c) => c.status === "risco_abandono" || c.status === "inativo",
+  );
+
+  return {
+    periodos: periodos.map((p) => p.nome),
+    ativos,
+    novos,
+    retornados,
+    frequenciaReduzida,
+    perdidos,
+    faturamentoNovos: preciseRound(
+      novos.reduce((s, c) => s + c.totalGeral, 0),
+      4,
+    ),
+    faturamentoPerdidos: preciseRound(
+      perdidos.reduce((s, c) => s + c.faturamentoUltimoPeriodo, 0),
+      4,
+    ),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Main analysis entry point
 // ---------------------------------------------------------------------------
@@ -392,9 +553,10 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     );
   }
 
-  const sheetNames = wb.SheetNames;
-  // Use up to 6 most recent sheets for the portfolio analysis window
-  const maxPeriods = Math.min(sheetNames.length, 6);
+  // Order the tabs by month first, so the window is the 6 most recent months
+  // rather than the last 6 tabs in whatever order they happen to be saved.
+  const sheetNames = ordenarPeriodosCronologicamente(wb.SheetNames);
+  const maxPeriods = Math.min(sheetNames.length, MAX_PERIODOS_CARTEIRA);
   const periodSheetNames = sheetNames.slice(sheetNames.length - maxPeriods);
 
   const periodos = periodSheetNames.map((name) =>
@@ -519,6 +681,7 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
 
   // ---- 6-month portfolio classification ---------------------------------------
   const classificacaoCarteira = classificarCarteira(periodos);
+  const carteira = resumirCarteira(periodos, classificacaoCarteira);
 
   // ---- Merge validation reports into one combined report ----------------------
   // Scoped to the two comparison periods only, so every already-validated number
@@ -560,6 +723,7 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     comparativoProdutos,
     inconsistencias,
     classificacaoCarteira,
+    carteira,
     validationReport,
   };
 }
