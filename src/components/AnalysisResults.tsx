@@ -15,6 +15,7 @@ import {
   Info,
   CalendarRange,
   RotateCcw,
+  FileSpreadsheet,
 } from "lucide-react";
 import { KpiCard } from "./KpiCard";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -69,6 +70,9 @@ export function AnalysisResults({ result }: Props) {
     Faturamento: p.faturamento,
     Clientes: p.clientes,
   }));
+
+  // Tabs that were read but yielded nothing — the shape a lost month takes.
+  const periodosVazios = result.periodos.filter((p) => p.clientes.size === 0);
 
   const vr = result.validationReport;
   const hasAlerts = result.inconsistencias.length > 0 || vr.diagnostics.length > 0;
@@ -125,8 +129,9 @@ export function AnalysisResults({ result }: Props) {
           <div className="flex flex-wrap items-center gap-1.5">
             {result.periodos.map((p, i) => (
               <Badge
-                key={p.nome}
+                key={p.sheetName}
                 variant="outline"
+                title={`Aba "${p.sheetName}" · ${p.linhasLidas} linhas · ${p.clientes.size} clientes · ${p.produtosLidos} produtos`}
                 className={
                   i === result.periodos.length - 1
                     ? "border-primary/40 bg-primary/10 text-primary"
@@ -135,15 +140,45 @@ export function AnalysisResults({ result }: Props) {
               >
                 {p.nome}
                 {i === result.periodos.length - 1 && " (atual)"}
+                <span className="ml-1.5 opacity-70">
+                  {p.clientes.size} cli · {p.produtosLidos} prod
+                </span>
               </Badge>
             ))}
           </div>
           <span className="text-xs text-muted-foreground">
-            Faturamento, produtos e validação seguem comparando{" "}
+            Todos os {result.periodos.length}{" "}
+            {result.periodos.length === 1 ? "mês entra" : "meses entram"} nos cálculos,
+            produtos, carteira e validação. A variação mês a mês do topo compara{" "}
             {result.periodoAnterior.nome} × {result.periodoAtual.nome}.
           </span>
         </CardContent>
       </Card>
+
+      {/* Tabs left out of the analysis — never silently */}
+      {(result.leitura.abasIgnoradas.length > 0 || periodosVazios.length > 0) && (
+        <Card className="border-yellow-500/50 bg-yellow-500/5">
+          <CardContent className="space-y-1 py-3 text-sm">
+            <div className="flex items-center gap-2 font-medium text-yellow-700 dark:text-yellow-500">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              Nem toda aba do arquivo virou período
+            </div>
+            {result.leitura.abasIgnoradas.map((a) => (
+              <p key={a.sheetName} className="text-muted-foreground">
+                Aba <span className="font-medium text-foreground">"{a.sheetName}"</span> não foi
+                lida como período: {a.motivo}.
+              </p>
+            ))}
+            {periodosVazios.map((p) => (
+              <p key={p.sheetName} className="text-muted-foreground">
+                Aba <span className="font-medium text-foreground">"{p.sheetName}"</span> tem{" "}
+                {p.linhasLidas} linhas, mas nenhum cliente foi reconhecido — o período entra
+                zerado. Confira o layout dessa aba.
+              </p>
+            ))}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Validation summary banner */}
       <Card className={vr.valid ? "border-accent/50 bg-accent/5" : "border-destructive/50 bg-destructive/5"}>
@@ -494,6 +529,63 @@ export function AnalysisResults({ result }: Props) {
 
         {/* Validation Report Tab */}
         <TabsContent value="validacao" className="space-y-4">
+          {/* What was read from the file, tab by tab */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <FileSpreadsheet className="h-4 w-4 text-primary" /> Leitura do arquivo ·{" "}
+                {result.leitura.abasLidas.length} de {result.leitura.abasNoArquivo.length} abas
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Aba</TableHead>
+                    <TableHead>Período</TableHead>
+                    <TableHead>Identificado por</TableHead>
+                    <TableHead className="text-right">Linhas</TableHead>
+                    <TableHead className="text-right">Clientes</TableHead>
+                    <TableHead className="text-right">Produtos</TableHead>
+                    <TableHead className="text-right">Faturamento</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {result.periodos.map((p) => (
+                    <TableRow key={p.sheetName}>
+                      <TableCell className="font-medium">
+                        {p.sheetName}
+                        {p.oculta && (
+                          <Badge variant="outline" className="ml-2 text-muted-foreground">
+                            oculta
+                          </Badge>
+                        )}
+                      </TableCell>
+                      <TableCell>{p.nome}</TableCell>
+                      <TableCell className="text-muted-foreground">
+                        {origemPeriodoLabel(p.origemPeriodo)}
+                      </TableCell>
+                      <TableCell className="text-right">{p.linhasLidas}</TableCell>
+                      <TableCell
+                        className={`text-right ${p.clientes.size === 0 ? "font-semibold text-destructive" : ""}`}
+                      >
+                        {p.clientes.size}
+                      </TableCell>
+                      <TableCell className="text-right">{p.produtosLidos}</TableCell>
+                      <TableCell className="text-right">{fmt(p.totalFaturamento)}</TableCell>
+                    </TableRow>
+                  ))}
+                  {result.leitura.abasIgnoradas.map((a) => (
+                    <TableRow key={a.sheetName} className="text-muted-foreground">
+                      <TableCell className="font-medium">{a.sheetName}</TableCell>
+                      <TableCell colSpan={6}>Não lida — {a.motivo}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+
           {/* Layer summary */}
           <Card>
             <CardHeader>
@@ -641,6 +733,17 @@ function variacaoTotal(result: AnalysisResult): number {
 function janelaLabel(result: AnalysisResult): string {
   const n = result.periodos.length - 1;
   return n === 1 ? "1 mês" : `${n} meses`;
+}
+
+function origemPeriodoLabel(origem: AnalysisResult["periodos"][number]["origemPeriodo"]): string {
+  switch (origem) {
+    case "nome-da-aba":
+      return "nome da aba";
+    case "conteudo":
+      return "conteúdo da aba";
+    default:
+      return "ordem no arquivo";
+  }
 }
 
 function layerLabel(layer: string): string {

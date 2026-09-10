@@ -1,4 +1,17 @@
-import * as XLSX from "xlsx";
+import {
+  descobrirAbas,
+  lerPastaDeTrabalho,
+  lerCabecalhoCliente,
+  lerCabecalhoProdutos,
+  lerPeriodoDoNome,
+  normalizarTexto,
+  ordenarPorPeriodo,
+  COLUNA_AUSENTE,
+  type AbaDescoberta,
+  type AbaIgnorada,
+  type ColumnMap,
+  type SheetRows,
+} from "./sheet-discovery";
 import {
   ExcelValidator,
   preciseMultiply,
@@ -53,11 +66,23 @@ export interface ClientData {
 }
 
 export interface PeriodData {
+  /** Label used across the analysis (tab name, or the period read from content) */
   nome: string;
+  /** Tab name exactly as it appears in the file */
+  sheetName: string;
   clientes: Map<string, ClientData>;
   totalFaturamento: number;
   /** Validation report for this period */
   validationReport: ValidationReport;
+  /** How the period was identified */
+  origemPeriodo: AbaDescoberta["origemPeriodo"];
+  mes?: number;
+  ano?: number;
+  /** Tab is hidden in the file but was read all the same */
+  oculta: boolean;
+  /** Evidence that the tab was really processed, not merely opened */
+  linhasLidas: number;
+  produtosLidos: number;
 }
 
 export interface ProductComparison {
@@ -108,8 +133,9 @@ export interface ClienteCarteira {
 }
 
 /**
- * Client portfolio read over the whole analysis window (up to 6 months), as
- * opposed to the strict month-over-month comparison kept in AnalysisResult.
+ * Client portfolio read over the whole analysis window — every period found in
+ * the file — as opposed to the strict month-over-month comparison kept in
+ * AnalysisResult.
  */
 export interface CarteiraResumo {
   /** Period names in the window, oldest first */
@@ -130,11 +156,23 @@ export interface CarteiraResumo {
   faturamentoPerdidos: number;
 }
 
+/** What the reader found in the file — so a missing tab is visible, not silent. */
+export interface LeituraPlanilha {
+  /** Every tab name in the file, in file order */
+  abasNoArquivo: string[];
+  /** Tabs read as periods, oldest first */
+  abasLidas: string[];
+  /** Tabs left out, each with the reason why */
+  abasIgnoradas: AbaIgnorada[];
+}
+
 export interface AnalysisResult {
   periodoAnterior: PeriodData;
   periodoAtual: PeriodData;
-  /** All parsed periods used for the 6-month portfolio analysis (up to 6, oldest first) */
+  /** Every period found in the file, oldest first — no cap */
   periodos: PeriodData[];
+  /** Tab-by-tab account of what was read and what was left out */
+  leitura: LeituraPlanilha;
   clientesNovos: ClientData[];
   clientesPerdidos: ClientData[];
   clientesMantidos: string[];
@@ -143,7 +181,7 @@ export interface AnalysisResult {
   variacaoFaturamento: number;
   comparativoProdutos: ProductComparison[];
   inconsistencias: string[];
-  /** 6-month portfolio classification for every client found in any period */
+  /** Portfolio classification for every client found in any period of the file */
   classificacaoCarteira: ClienteCarteira[];
   /** Portfolio figures computed over the whole window (drives the KPI cards) */
   carteira: CarteiraResumo;
@@ -157,40 +195,87 @@ export interface AnalysisResult {
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Minimum columns expected in a product row */
-const MIN_PRODUCT_COLS = 6;
-
-/** Column indices */
-const COL = {
-  CODIGO: 0,
-  DESCRICAO: 1,
-  UNIDADE: 2,
-  QUANTIDADE: 3,
-  PRECO_MEDIO: 4,
-  VENDA_BRUTA: 5,
-} as const;
-
-/** Maximum number of monthly sheets considered by the portfolio analysis */
-export const MAX_PERIODOS_CARTEIRA = 6;
-
 /** Tolerance for math checks (in currency units) */
 const MATH_TOLERANCE = 0.01;
 /** Tolerance for aggregation checks */
 const AGGREGATION_TOLERANCE = 0.05;
 
+/** Product codes seen in the exports: "5001", "PA-001", "12.345", "AB/2" */
+const RE_CODIGO_PRODUTO = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+
+/**
+ * Lines that close the current client block: whatever comes after them
+ * ("Totais por unidade" and its per-unit rows) is no longer that client's
+ * products.
+ */
+const RE_FIM_DE_BLOCO = /^(totais?\b|total geral|subtotal|quantidade total|valor total geral)/;
+
+/**
+ * Page furniture. Skipped without closing the block — a paginated export prints
+ * these in the middle of a client and then goes on with that client's products.
+ */
+const RE_LINHA_IGNORADA =
+  /^(gerado em|emitido|impresso|pagina\b|página\b|folha\b|filtros?\b|relatorio|relatório|periodo\b|período\b|vendas de produto)/;
+
+// ---------------------------------------------------------------------------
+// Row helpers
+// ---------------------------------------------------------------------------
+
+function ehNumero(value: unknown): boolean {
+  if (typeof value === "number") return Number.isFinite(value);
+  const texto = String(value ?? "").trim();
+  if (!texto) return false;
+  // "1.234,56" and "1234.56" both show up depending on the export
+  return Number.isFinite(Number(texto.replace(/\./g, "").replace(",", ".")));
+}
+
+function paraNumero(value: unknown): number {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  const texto = String(value ?? "").trim();
+  if (!texto) return 0;
+  const n = Number(texto.replace(/\s/g, "").replace(/\./g, "").replace(",", "."));
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** Cell at `col`, or "" when the column is absent from this sheet. */
+function celula(row: SheetRows[number], col: number): unknown {
+  return col === COLUNA_AUSENTE ? null : row[col];
+}
+
+/** First cell of the row that holds text — used to spot summary lines. */
+function primeiroTexto(row: SheetRows[number]): string {
+  for (const cell of row) {
+    const texto = String(cell ?? "").trim();
+    if (texto && !ehNumero(cell)) return normalizarTexto(texto);
+  }
+  return "";
+}
+
 // ---------------------------------------------------------------------------
 // Period Parser with full validation
 // ---------------------------------------------------------------------------
 
-function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
-  const rows: (string | number | null)[][] = XLSX.utils.sheet_to_json(sheet, {
-    header: 1,
-    defval: null,
-  });
+/**
+ * Reads one report tab into a period.
+ *
+ * The tab is read through the layout discovered for it, not through fixed column
+ * indices, so an export that indents the report or renames a column still gets
+ * read instead of coming back empty.
+ */
+function parsePeriod(aba: AbaDescoberta): PeriodData {
+  const { rows, nome } = aba;
 
   const validator = new ExcelValidator(nome);
   const clientes = new Map<string, ClientData>();
   let currentClient: ClientData | null = null;
+  /**
+   * Reported subtotal of each block of a client — a client listed on two report
+   * pages has two blocks, and its total is the sum of both, not the last one.
+   */
+  const subtotais = new Map<ClientData, number[]>();
+  /** Refreshed every time a product header row shows up in the tab. */
+  let colunas: ColumnMap = aba.colunas;
+  let produtosLidos = 0;
 
   // Track client entries for duplicate detection
   const clientEntries: { key: string; label: string; row: number }[] = [];
@@ -201,26 +286,38 @@ function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
 
     if (!row || row.length === 0) continue;
 
-    const firstCell = String(row[0] ?? "").trim();
+    // ---- Product header: re-reads the column layout for the rows below --------
+    const cabecalho = lerCabecalhoProdutos(row);
+    if (cabecalho) {
+      colunas = cabecalho;
+      continue;
+    }
 
-    // ---- Detect client header ------------------------------------------------
-    if (firstCell.startsWith("Cliente:")) {
-      const match = firstCell.match(/Cliente:\s*(\d+)\s*-\s*(.+?)(?:\s*-\s*Data|$)/);
-      if (match) {
-        const codigoCliente = match[1];
-        const nomeCliente = match[2].trim();
+    // ---- Client header (any column, any casing, any dash) --------------------
+    const cliente = lerCabecalhoCliente(row);
+    if (cliente) {
+      const { codigo: codigoCliente, nome: nomeCliente, coluna } = cliente;
 
-        // Layer 1: Existence — client code and name must exist
-        validator.checkExistence(codigoCliente, excelRow, COL.CODIGO, "codigoCliente");
-        validator.checkExistence(nomeCliente, excelRow, COL.CODIGO, "nomeCliente");
+      // Layer 1: Existence — client code and name must exist
+      validator.checkExistence(codigoCliente, excelRow, coluna, "codigoCliente");
+      validator.checkExistence(nomeCliente, excelRow, coluna, "nomeCliente");
 
-        // Layer 3: Integrity — client name should not be too short
-        if (nomeCliente) {
-          validator.checkStringIntegrity(nomeCliente, excelRow, COL.CODIGO, "nomeCliente", { minLength: 2 });
-        }
+      // Layer 3: Integrity — client name should not be too short
+      if (nomeCliente) {
+        validator.checkStringIntegrity(nomeCliente, excelRow, coluna, "nomeCliente", {
+          minLength: 2,
+        });
+      }
 
-        clientEntries.push({ key: nomeCliente, label: nomeCliente, row: excelRow });
+      clientEntries.push({ key: nomeCliente, label: nomeCliente, row: excelRow });
 
+      // The same client can be listed twice in one tab (two report pages):
+      // keep the first block and append to it instead of dropping the earlier rows.
+      const existente = clientes.get(nomeCliente);
+      if (existente) {
+        currentClient = existente;
+        subtotais.get(existente)!.push(0);
+      } else {
         currentClient = {
           nome: nomeCliente,
           codigoCliente,
@@ -231,67 +328,120 @@ function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
           origemLinha: excelRow,
         };
         clientes.set(nomeCliente, currentClient);
+        subtotais.set(currentClient, [0]);
       }
       continue;
     }
 
-    // Skip header / empty / summary rows
-    if (
-      firstCell === "Código" ||
-      firstCell === "" ||
-      firstCell === "Totais por unidade:" ||
-      firstCell.startsWith("Quantidade total") ||
-      firstCell.startsWith("Gerado em")
-    ) {
+    const codigo = String(celula(row, colunas.codigo) ?? "").trim();
+    const descricao = String(celula(row, colunas.descricao) ?? "").trim();
+    const temNumero =
+      ehNumero(celula(row, colunas.quantidade)) ||
+      ehNumero(celula(row, colunas.vendaBruta)) ||
+      ehNumero(celula(row, colunas.precoMedio));
+
+    // A product row carries a code and a description under the current client.
+    const ehProduto =
+      !!currentClient && !!codigo && RE_CODIGO_PRODUTO.test(codigo) && descricao !== "";
+
+    // ---- Summary / footer rows ----------------------------------------------
+    // Checked after the product test so a product named "TOTAL FLEX 5L" is not
+    // mistaken for a totals line.
+    if (!ehProduto) {
+      const marcador = primeiroTexto(row);
+      if (RE_FIM_DE_BLOCO.test(marcador)) {
+        // The totals block ends the client: its rows are not products.
+        currentClient = null;
+        continue;
+      }
+      if (RE_LINHA_IGNORADA.test(marcador)) continue;
+    }
+
+    // A coded line with values but no description cannot join the product
+    // comparison — flag it instead of letting it in as a nameless product.
+    if (currentClient && !ehProduto && codigo && RE_CODIGO_PRODUTO.test(codigo) && temNumero) {
+      validator.checkCrossField(
+        false,
+        excelRow,
+        colunas.descricao,
+        "descricao",
+        "Linha com código e valores precisa de descrição do produto",
+        `Linha ${excelRow} da aba ${nome}: código ${codigo} com valores mas sem descrição — ` +
+          `linha ignorada no comparativo de produtos.`,
+      );
       continue;
     }
 
     // ---- Product row ---------------------------------------------------------
-    const codigo = firstCell;
-    const isProductRow = /^\d+$/.test(codigo) && currentClient;
-
-    if (isProductRow && currentClient) {
-      // Layer 4: Structure — row must have enough columns
-      if (!validator.checkStructure(row, excelRow, MIN_PRODUCT_COLS, `Produto ${codigo}`)) {
+    if (ehProduto && currentClient) {
+      // Layer 4: Structure — the row must reach the columns the layout declares
+      const colunasNecessarias =
+        Math.max(
+          colunas.codigo,
+          colunas.descricao,
+          colunas.quantidade,
+          colunas.vendaBruta,
+          colunas.precoMedio,
+          colunas.unidade,
+        ) + 1;
+      if (!validator.checkStructure(row, excelRow, colunasNecessarias, `Produto ${codigo}`)) {
         continue;
       }
 
       // Layer 5: Traceability — trace every value to its cell
-      const tCodigo = validator.traceValue(codigo, excelRow, COL.CODIGO);
-      const tDescricao = validator.traceValue(String(row[COL.DESCRICAO] ?? ""), excelRow, COL.DESCRICAO);
-      const tUnidade = validator.traceValue(String(row[COL.UNIDADE] ?? ""), excelRow, COL.UNIDADE);
+      const tCodigo = validator.traceValue(codigo, excelRow, colunas.codigo);
+      const tDescricao = validator.traceValue(descricao, excelRow, colunas.descricao);
+      const tUnidade = validator.traceValue(
+        String(celula(row, colunas.unidade) ?? ""),
+        excelRow,
+        colunas.unidade === COLUNA_AUSENTE ? colunas.descricao : colunas.unidade,
+      );
 
       // Layer 1: Existence — mandatory fields
-      validator.checkExistence(row[COL.DESCRICAO], excelRow, COL.DESCRICAO, "descricao");
-      validator.checkExistence(row[COL.QUANTIDADE], excelRow, COL.QUANTIDADE, "quantidade");
-      validator.checkExistence(row[COL.PRECO_MEDIO], excelRow, COL.PRECO_MEDIO, "precoMedio");
-      validator.checkExistence(row[COL.VENDA_BRUTA], excelRow, COL.VENDA_BRUTA, "vendaBruta");
+      validator.checkExistence(celula(row, colunas.descricao), excelRow, colunas.descricao, "descricao");
+      validator.checkExistence(celula(row, colunas.quantidade), excelRow, colunas.quantidade, "quantidade");
+      validator.checkExistence(celula(row, colunas.vendaBruta), excelRow, colunas.vendaBruta, "vendaBruta");
+      if (colunas.precoMedio !== COLUNA_AUSENTE) {
+        validator.checkExistence(celula(row, colunas.precoMedio), excelRow, colunas.precoMedio, "precoMedio");
+      }
 
       // Layer 2: Type — numeric fields must be numbers
-      validator.checkType(row[COL.QUANTIDADE], "number", excelRow, COL.QUANTIDADE, "quantidade");
-      validator.checkType(row[COL.PRECO_MEDIO], "number", excelRow, COL.PRECO_MEDIO, "precoMedio");
-      validator.checkType(row[COL.VENDA_BRUTA], "number", excelRow, COL.VENDA_BRUTA, "vendaBruta");
-      validator.checkType(row[COL.DESCRICAO], "string", excelRow, COL.DESCRICAO, "descricao");
+      validator.checkType(celula(row, colunas.quantidade), "number", excelRow, colunas.quantidade, "quantidade");
+      validator.checkType(celula(row, colunas.vendaBruta), "number", excelRow, colunas.vendaBruta, "vendaBruta");
+      validator.checkType(celula(row, colunas.descricao), "string", excelRow, colunas.descricao, "descricao");
+      if (colunas.precoMedio !== COLUNA_AUSENTE) {
+        validator.checkType(celula(row, colunas.precoMedio), "number", excelRow, colunas.precoMedio, "precoMedio");
+      }
 
-      const quantidade = Number(row[COL.QUANTIDADE]) || 0;
-      const precoMedio = Number(row[COL.PRECO_MEDIO]) || 0;
-      const vendaBruta = Number(row[COL.VENDA_BRUTA]) || 0;
+      const quantidade = paraNumero(celula(row, colunas.quantidade));
+      const vendaBruta = paraNumero(celula(row, colunas.vendaBruta));
+      // Without a unit-price column the average price is derived, never invented.
+      const precoMedio =
+        colunas.precoMedio !== COLUNA_AUSENTE
+          ? paraNumero(celula(row, colunas.precoMedio))
+          : quantidade > 0
+            ? preciseRound(vendaBruta / quantidade, 4)
+            : 0;
 
       // Traceability for numeric values
-      const tQuantidade = validator.traceValue(quantidade, excelRow, COL.QUANTIDADE);
-      const tPrecoMedio = validator.traceValue(precoMedio, excelRow, COL.PRECO_MEDIO);
-      const tVendaBruta = validator.traceValue(vendaBruta, excelRow, COL.VENDA_BRUTA);
+      const tQuantidade = validator.traceValue(quantidade, excelRow, colunas.quantidade);
+      const tPrecoMedio = validator.traceValue(
+        precoMedio,
+        excelRow,
+        colunas.precoMedio === COLUNA_AUSENTE ? colunas.vendaBruta : colunas.precoMedio,
+      );
+      const tVendaBruta = validator.traceValue(vendaBruta, excelRow, colunas.vendaBruta);
 
       // Layer 3: Integrity — numeric ranges
-      validator.checkNumericIntegrity(quantidade, excelRow, COL.QUANTIDADE, "quantidade");
-      validator.checkNumericIntegrity(precoMedio, excelRow, COL.PRECO_MEDIO, "precoMedio");
-      validator.checkNumericIntegrity(vendaBruta, excelRow, COL.VENDA_BRUTA, "vendaBruta");
+      validator.checkNumericIntegrity(quantidade, excelRow, colunas.quantidade, "quantidade");
+      validator.checkNumericIntegrity(precoMedio, excelRow, tPrecoMedio.origin.col, "precoMedio");
+      validator.checkNumericIntegrity(vendaBruta, excelRow, colunas.vendaBruta, "vendaBruta");
 
       // Cross-field: if qty > 0 then price should > 0 and vice versa
       validator.checkCrossField(
         !(quantidade > 0 && precoMedio === 0),
         excelRow,
-        COL.PRECO_MEDIO,
+        tPrecoMedio.origin.col,
         "precoMedio",
         "Se quantidade > 0, preco medio deve ser > 0",
         `Produto ${codigo}: Quantidade ${quantidade} com preco medio zero — possivel dado faltante.`,
@@ -309,7 +459,7 @@ function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
 
       currentClient.produtos.push({
         produto: tDescricao.value,
-        codigo: tCodigo.value as string,
+        codigo: tCodigo.value,
         unidade: tUnidade.value,
         valorUnitario: precoMedio,
         quantidade,
@@ -326,15 +476,23 @@ function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
           valorTotal: tVendaBruta.origin,
         },
       });
+      produtosLidos++;
       continue;
     }
 
     // ---- Subtotal row --------------------------------------------------------
-    if (!firstCell && currentClient && row[COL.QUANTIDADE] && row[COL.VENDA_BRUTA]) {
-      currentClient.totalGeral = Number(row[COL.VENDA_BRUTA]) || 0;
+    if (
+      !codigo &&
+      currentClient &&
+      ehNumero(celula(row, colunas.quantidade)) &&
+      ehNumero(celula(row, colunas.vendaBruta))
+    ) {
+      const subtotal = paraNumero(celula(row, colunas.vendaBruta));
+      const blocos = subtotais.get(currentClient)!;
+      blocos[blocos.length - 1] = subtotal;
 
       // Layer 5: trace the subtotal
-      validator.traceValue(currentClient.totalGeral, excelRow, COL.VENDA_BRUTA);
+      validator.traceValue(subtotal, excelRow, colunas.vendaBruta);
       continue;
     }
   }
@@ -348,6 +506,7 @@ function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
     const productValues = c.produtos.map((p) => p.valorTotal);
     const sumProdutos = preciseSum(productValues);
     c.totalRecalculado = sumProdutos;
+    c.totalGeral = preciseSum(subtotais.get(c) ?? []);
 
     if (c.totalGeral === 0) {
       c.totalGeral = sumProdutos;
@@ -362,7 +521,7 @@ function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
     }
 
     // Duplicate product detection within same client
-    const prodEntries = c.produtos.map((p, i) => ({
+    const prodEntries = c.produtos.map((p) => ({
       key: p.codigo,
       label: `${p.produto} (${p.codigo})`,
       row: p.origens.codigo.row,
@@ -374,96 +533,41 @@ function parsePeriod(sheet: XLSX.WorkSheet, nome: string): PeriodData {
 
   totalFaturamento = preciseRound(totalFaturamento, 4);
 
-  return { nome, clientes, totalFaturamento, validationReport: validator.getReport() };
+  return {
+    nome,
+    sheetName: aba.sheetName,
+    clientes,
+    totalFaturamento,
+    validationReport: validator.getReport(),
+    origemPeriodo: aba.origemPeriodo,
+    mes: aba.mes,
+    ano: aba.ano,
+    oculta: aba.oculta,
+    linhasLidas: aba.linhas,
+    produtosLidos,
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Chronological ordering of period sheets
 // ---------------------------------------------------------------------------
 
-const MESES: Record<string, number> = {
-  janeiro: 1, jan: 1,
-  fevereiro: 2, fev: 2,
-  marco: 3, mar: 3,
-  abril: 4, abr: 4,
-  maio: 5, mai: 5,
-  junho: 6, jun: 6,
-  julho: 7, jul: 7,
-  agosto: 8, ago: 8,
-  setembro: 9, set: 9, sep: 9,
-  outubro: 10, out: 10,
-  novembro: 11, nov: 11,
-  dezembro: 12, dez: 12,
-};
-
-interface SheetPeriod {
-  name: string;
-  index: number;
-  month?: number;
-  year?: number;
-}
-
-/** Extracts month/year from a sheet name ("junho", "junho/2025", "06/2025", "2025-06"). */
-function parseSheetPeriod(name: string, index: number): SheetPeriod {
-  const norm = name
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, ""); // "março" -> "marco"
-
-  let m = norm.match(/^(\d{4})[-/.](\d{1,2})$/);
-  if (m) return { name, index, year: Number(m[1]), month: Number(m[2]) };
-
-  m = norm.match(/^(\d{1,2})[-/.](\d{4})$/);
-  if (m) return { name, index, month: Number(m[1]), year: Number(m[2]) };
-
-  const month = (norm.match(/[a-z]+/g) ?? [])
-    .map((w) => MESES[w])
-    .find((v) => v !== undefined);
-  const yearMatch = norm.match(/\b(\d{4})\b/);
-
-  return { name, index, month, year: yearMatch ? Number(yearMatch[1]) : undefined };
-}
-
 /**
- * Orders period sheets chronologically so the analysis window does not depend on
- * the order the tabs happen to be saved in. Sheet names that don't name a
- * recognizable month are left in workbook order (nothing reliable to sort by).
+ * Orders period tabs chronologically so the analysis window does not depend on
+ * the order the tabs happen to be saved in. Tab names that don't name a
+ * recognizable month keep their slot — one unrecognised tab must not stop the
+ * months around it from being ordered.
+ *
+ * Kept as a thin wrapper over the shared discovery helpers: the ordering rule
+ * lives in one place and is the same one `analyzeWorkbook` applies.
  */
 export function ordenarPeriodosCronologicamente(names: string[]): string[] {
-  const parsed = names.map(parseSheetPeriod);
-
-  if (parsed.some((p) => p.month === undefined)) return names;
-
-  // Explicit years on every sheet: a plain (year, month) sort is unambiguous.
-  if (parsed.every((p) => p.year !== undefined)) {
-    return [...parsed]
-      .sort((a, b) => a.year! - b.year! || a.month! - b.month! || a.index - b.index)
-      .map((p) => p.name);
-  }
-
-  // No years: pick the 12-month rotation that packs the months into the
-  // shortest span, so novembro → dezembro → janeiro sorts across the year end
-  // instead of collapsing to janeiro → novembro → dezembro.
-  const meses = [...new Set(parsed.map((p) => p.month!))];
-  let inicio = meses[0];
-  let menorSpan = Infinity;
-  for (const s of meses) {
-    const span = Math.max(...meses.map((m) => (m - s + 12) % 12));
-    if (span < menorSpan) {
-      menorSpan = span;
-      inicio = s;
-    }
-  }
-  const rank = (m: number) => (m - inicio + 12) % 12;
-
-  return [...parsed]
-    .sort((a, b) => rank(a.month!) - rank(b.month!) || a.index - b.index)
-    .map((p) => p.name);
+  const itens = names.map((name, index) => ({ name, index, ...lerPeriodoDoNome(name) }));
+  return ordenarPorPeriodo(itens).map((p) => p.name);
 }
 
 // ---------------------------------------------------------------------------
-// 6-month portfolio classifier
+// Portfolio classifier over the whole window
 // ---------------------------------------------------------------------------
 
 function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
@@ -542,14 +646,21 @@ function resumirEvolucao(periodos: PeriodData[]): PeriodoResumo[] {
   });
 }
 
+interface ProdutoAgregado {
+  qtd: number;
+  valor: number;
+  codigo: string;
+}
+
 /** Revenue/quantity per product, for one period. */
-function agregarProdutos(periodo: PeriodData): Map<string, { qtd: number; valor: number }> {
-  const m = new Map<string, { qtd: number; valor: number }>();
+function agregarProdutos(periodo: PeriodData): Map<string, ProdutoAgregado> {
+  const m = new Map<string, ProdutoAgregado>();
   for (const c of periodo.clientes.values()) {
     for (const p of c.produtos) {
-      const e = m.get(p.produto) ?? { qtd: 0, valor: 0 };
+      const e = m.get(p.produto) ?? { qtd: 0, valor: 0, codigo: p.codigo };
       e.qtd = preciseRound(e.qtd + p.quantidade, 4);
       e.valor = preciseRound(e.valor + p.valorTotal, 4);
+      if (!e.codigo) e.codigo = p.codigo;
       m.set(p.produto, e);
     }
   }
@@ -609,27 +720,34 @@ function resumirCarteira(
 // ---------------------------------------------------------------------------
 
 export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
-  // NOTE: legacy .xls (CFB/BIFF8) files fail to parse when a raw ArrayBuffer is
-  // passed — SheetJS returns a single bogus "Sheet1" instead of the real tabs.
-  // Wrapping in a Uint8Array parses every sheet correctly for both .xls and .xlsx.
-  const wb = XLSX.read(new Uint8Array(buffer), { type: "array" });
+  const wb = lerPastaDeTrabalho(buffer);
 
-  if (wb.SheetNames.length < 2) {
+  // Every tab that holds report data becomes a period — identified by content,
+  // ordered by the month it covers, with no cap on how many months are read.
+  const descoberta = descobrirAbas(wb);
+
+  if (descoberta.abas.length < 2) {
+    const encontradas = descoberta.todasAsAbas.length
+      ? descoberta.todasAsAbas.join(", ")
+      : "nenhuma";
+    const motivos = descoberta.ignoradas.length
+      ? ` Abas descartadas: ${descoberta.ignoradas
+          .map((a) => `"${a.sheetName}" (${a.motivo})`)
+          .join("; ")}.`
+      : "";
     throw new Error(
-      `A planilha precisa ter pelo menos 2 abas (períodos). ` +
-        `Abas encontradas: ${wb.SheetNames.length ? wb.SheetNames.join(", ") : "nenhuma"}.`,
+      `A planilha precisa ter pelo menos 2 abas (períodos) com dados de relatório. ` +
+        `Abas encontradas: ${encontradas}.${motivos}`,
     );
   }
 
-  // Order the tabs by month first, so the window is the 6 most recent months
-  // rather than the last 6 tabs in whatever order they happen to be saved.
-  const sheetNames = ordenarPeriodosCronologicamente(wb.SheetNames);
-  const maxPeriods = Math.min(sheetNames.length, MAX_PERIODOS_CARTEIRA);
-  const periodSheetNames = sheetNames.slice(sheetNames.length - maxPeriods);
+  const periodos = descoberta.abas.map(parsePeriod);
 
-  const periodos = periodSheetNames.map((name) =>
-    parsePeriod(wb.Sheets[name], name),
-  );
+  const leitura: LeituraPlanilha = {
+    abasNoArquivo: descoberta.todasAsAbas,
+    abasLidas: periodos.map((p) => p.sheetName),
+    abasIgnoradas: descoberta.ignoradas,
+  };
 
   const periodoAnterior = periodos[periodos.length - 2];
   const periodoAtual = periodos[periodos.length - 1];
@@ -675,49 +793,40 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
         )
       : 0;
 
-  // ---- Product comparison with precision -------------------------------------
-  const produtosAnterior = new Map<string, { qtd: number; valor: number; codigo: string }>();
-  const produtosAtual = new Map<string, { qtd: number; valor: number; codigo: string }>();
-
-  for (const c of periodoAnterior.clientes.values()) {
-    for (const p of c.produtos) {
-      const key = p.produto;
-      const existing = produtosAnterior.get(key) || { qtd: 0, valor: 0, codigo: p.codigo };
-      existing.qtd = preciseRound(existing.qtd + p.quantidade, 4);
-      existing.valor = preciseRound(existing.valor + p.valorTotal, 4);
-      produtosAnterior.set(key, existing);
-    }
-  }
-  for (const c of periodoAtual.clientes.values()) {
-    for (const p of c.produtos) {
-      const key = p.produto;
-      const existing = produtosAtual.get(key) || { qtd: 0, valor: 0, codigo: p.codigo };
-      existing.qtd = preciseRound(existing.qtd + p.quantidade, 4);
-      existing.valor = preciseRound(existing.valor + p.valorTotal, 4);
-      produtosAtual.set(key, existing);
-    }
-  }
-
-  // Per-period product totals, so the summary can chart every month of the window.
+  // ---- Product comparison ----------------------------------------------------
+  // Aggregated once per period, so every month of the file feeds the product
+  // analysis instead of only the two compared months.
   const produtosPorPeriodo = periodos.map(agregarProdutos);
+  const vazio: ProdutoAgregado = { qtd: 0, valor: 0, codigo: "" };
 
-  const allProducts = new Set([...produtosAnterior.keys(), ...produtosAtual.keys()]);
+  const produtosAnterior = produtosPorPeriodo[produtosPorPeriodo.length - 2];
+  const produtosAtual = produtosPorPeriodo[produtosPorPeriodo.length - 1];
+
+  // The universe of products is the union of every period — a product sold in an
+  // earlier month and not in the last two must still show up in the comparison.
+  const allProducts = new Set<string>();
+  for (const mapa of produtosPorPeriodo) {
+    for (const nome of mapa.keys()) allProducts.add(nome);
+  }
+
   const comparativoProdutos: ProductComparison[] = [];
   for (const prod of allProducts) {
-    const ant = produtosAnterior.get(prod) || { qtd: 0, valor: 0, codigo: "" };
-    const atu = produtosAtual.get(prod) || { qtd: 0, valor: 0, codigo: ant.codigo };
+    const ant = produtosAnterior.get(prod) ?? vazio;
+    const atu = produtosAtual.get(prod) ?? vazio;
 
     const valorPorPeriodo: Record<string, number> = {};
     const qtdPorPeriodo: Record<string, number> = {};
+    let codigo = atu.codigo || ant.codigo;
     periodos.forEach((p, i) => {
       const e = produtosPorPeriodo[i].get(prod);
       valorPorPeriodo[p.nome] = e?.valor ?? 0;
       qtdPorPeriodo[p.nome] = e?.qtd ?? 0;
+      if (!codigo && e?.codigo) codigo = e.codigo;
     });
 
     comparativoProdutos.push({
       produto: prod,
-      codigo: atu.codigo || ant.codigo,
+      codigo,
       qtdAnterior: ant.qtd,
       qtdAtual: atu.qtd,
       variacaoQtd: ant.qtd > 0
@@ -735,8 +844,10 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   comparativoProdutos.sort((a, b) => b.valorAtual - a.valorAtual);
 
   // ---- Build human-readable inconsistencies ----------------------------------
+  // Every period of the file is audited — an inconsistency in an older month is
+  // still an inconsistency in the numbers the analysis is built on.
   const inconsistencias: string[] = [];
-  for (const period of [periodoAnterior, periodoAtual]) {
+  for (const period of periodos) {
     for (const c of period.clientes.values()) {
       for (const p of c.produtos) {
         if (!p.validado) {
@@ -761,22 +872,39 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     }
   }
 
-  // ---- 6-month portfolio classification ---------------------------------------
+  // ---- Portfolio classification over the whole window --------------------------
   const classificacaoCarteira = classificarCarteira(periodos);
   const carteira = resumirCarteira(periodos, classificacaoCarteira);
   const evolucaoPeriodos = resumirEvolucao(periodos);
 
   // ---- Merge validation reports into one combined report ----------------------
-  // Scoped to the two comparison periods only, so every already-validated number
-  // in the Validação/Alertas tabs stays exactly as it was. The extra historical
-  // periods feed the portfolio classification alone.
-  const periodosValidacao = [periodoAnterior, periodoAtual];
-  const allDiagnostics = periodosValidacao.flatMap((p) => p.validationReport.diagnostics);
-  const totalChecks = periodosValidacao.reduce((s, p) => s + p.validationReport.totalChecks, 0);
-  const passedChecks = periodosValidacao.reduce((s, p) => s + p.validationReport.passedChecks, 0);
+  // Covers every period read from the file: a month left out of the validation
+  // is a month nobody checked, which is how a whole tab used to go missing
+  // without a single alert.
+  const allDiagnostics = periodos.flatMap((p) => p.validationReport.diagnostics);
+  const totalChecks = periodos.reduce((s, p) => s + p.validationReport.totalChecks, 0);
+  const passedChecks = periodos.reduce((s, p) => s + p.validationReport.passedChecks, 0);
+
+  // A report tab that produced no client at all is a reading failure, not an
+  // empty month: surface it instead of letting the period show up as zero.
+  for (const p of periodos) {
+    if (p.clientes.size === 0) {
+      allDiagnostics.push({
+        layer: "structure",
+        severity: "error",
+        cellRef: `${p.nome}!A1`,
+        field: `aba ${p.sheetName}`,
+        actual: "nenhum cliente reconhecido",
+        expected: 'linhas no formato "Cliente: CÓDIGO - NOME"',
+        impact:
+          `A aba "${p.sheetName}" foi carregada (${p.linhasLidas} linhas) mas nenhum cliente ` +
+          `foi reconhecido — o período entra na análise zerado. Confira o layout dessa aba.`,
+      });
+    }
+  }
 
   const layerSummary: Record<string, { passed: number; failed: number }> = {};
-  for (const period of periodosValidacao) {
+  for (const period of periodos) {
     for (const [layer, counts] of Object.entries(period.validationReport.layerSummary)) {
       if (!layerSummary[layer]) layerSummary[layer] = { passed: 0, failed: 0 };
       layerSummary[layer].passed += counts.passed;
@@ -797,6 +925,7 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     periodoAnterior,
     periodoAtual,
     periodos,
+    leitura,
     clientesNovos,
     clientesPerdidos,
     clientesMantidos,

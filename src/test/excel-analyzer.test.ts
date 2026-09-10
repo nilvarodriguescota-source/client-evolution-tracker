@@ -11,16 +11,19 @@ import { analyzeWorkbook, ordenarPeriodosCronologicamente } from "../lib/excel-a
 function buildWorkbook(
   periods: Record<string, string[]>,
   bookType: XLSX.BookType = "xlsx",
+  /** sheet name -> product sold in it (defaults to PRODUTO A) */
+  produtoPorAba: Record<string, string> = {},
 ): ArrayBuffer {
   const wb = XLSX.utils.book_new();
 
   for (const [sheetName, clientes] of Object.entries(periods)) {
+    const produto = produtoPorAba[sheetName] ?? "PRODUTO A";
     const rows: (string | number | null)[][] = [];
     clientes.forEach((nome, i) => {
       rows.push([`Cliente: ${100 + i} - ${nome}`, null, null, null, null, null]);
       rows.push(["Código", "Descrição", "Unidade", "Qtd", "Preço Médio", "Venda Bruta"]);
       // qty 2 x price 10 = 20
-      rows.push(["5001", "PRODUTO A", "UN", 2, 10, 20]);
+      rows.push(["5001", produto, "UN", 2, 10, 20]);
       rows.push([null, null, null, 2, null, 20]);
       rows.push([]);
     });
@@ -44,19 +47,21 @@ describe("analyzeWorkbook — janela de análise da carteira", () => {
     expect(r.periodos.map((p) => p.nome)).toEqual(["junho", "julho", "agosto"]);
   });
 
-  it("considera até 6 períodos, mantendo os 2 últimos para a comparação", () => {
+  it("lê todos os períodos do arquivo, sem teto de abas", () => {
     const nomes = ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"];
     const periods = Object.fromEntries(nomes.map((n) => [n, ["CLIENTE A"]]));
     const r = analyzeWorkbook(buildWorkbook(periods));
 
-    // only the 6 most recent sheets feed the portfolio window
-    expect(r.periodos.map((p) => p.nome)).toEqual(["m3", "m4", "m5", "m6", "m7", "m8"]);
+    // every tab of the file is a period — nothing is dropped for being old
+    expect(r.periodos.map((p) => p.nome)).toEqual(nomes);
+    expect(r.leitura.abasLidas).toEqual(nomes);
+    expect(r.leitura.abasIgnoradas).toEqual([]);
     // the 2-period comparison is untouched
     expect(r.periodoAnterior.nome).toBe("m7");
     expect(r.periodoAtual.nome).toBe("m8");
   });
 
-  it("usa todas as abas quando há menos de 6", () => {
+  it("usa todas as abas quando há poucas", () => {
     const r = analyzeWorkbook(
       buildWorkbook({ junho: ["CLIENTE A"], julho: ["CLIENTE A"], agosto: ["CLIENTE A"] }),
     );
@@ -89,7 +94,7 @@ describe("analyzeWorkbook — janela de análise da carteira", () => {
 
   it("não marca como perdido o cliente sazonal que voltou a comprar", () => {
     // Present in the oldest period, absent for months, back in the current one.
-    // The 2-period view calls it "novo"; the 6-month view must call it active
+    // The 2-period view calls it "novo"; the window view must call it active
     // and show the full history.
     const r = analyzeWorkbook(
       buildWorkbook({
@@ -176,9 +181,14 @@ describe("ordenarPeriodosCronologicamente", () => {
     ]);
   });
 
-  it("mantém a ordem original quando alguma aba não nomeia um mês", () => {
-    const nomes = ["agosto", "Resumo", "junho"];
-    expect(ordenarPeriodosCronologicamente(nomes)).toEqual(nomes);
+  it("ordena os meses mesmo com uma aba que não nomeia mês no meio", () => {
+    // "Resumo" keeps its slot; junho and agosto are ordered around it instead of
+    // one unrecognised tab disabling the ordering for every month.
+    expect(ordenarPeriodosCronologicamente(["agosto", "Resumo", "junho"])).toEqual([
+      "junho",
+      "Resumo",
+      "agosto",
+    ]);
   });
 });
 
@@ -307,10 +317,20 @@ describe("evolucaoPeriodos — comparativo mês a mês", () => {
 
   it("zera o produto nos meses em que não houve venda", () => {
     const r = analyzeWorkbook(
-      buildWorkbook({ junho: [], julho: ["A"], agosto: ["A"] }),
+      buildWorkbook({ junho: ["A"], julho: ["A"], agosto: ["A"] }, "xlsx", {
+        junho: "PRODUTO B",
+      }),
     );
-    const prod = r.comparativoProdutos[0];
-    expect(prod.valorPorPeriodo.junho).toBe(0);
-    expect(prod.valorPorPeriodo.agosto).toBe(20);
+
+    const a = r.comparativoProdutos.find((p) => p.produto === "PRODUTO A")!;
+    expect(a.valorPorPeriodo.junho).toBe(0);
+    expect(a.valorPorPeriodo.agosto).toBe(20);
+
+    // sold only in junho — it must still be in the comparison, not disappear
+    // because the last two months don't carry it
+    const b = r.comparativoProdutos.find((p) => p.produto === "PRODUTO B")!;
+    expect(b).toBeDefined();
+    expect(b.valorPorPeriodo).toEqual({ junho: 20, julho: 0, agosto: 0 });
+    expect(b.valorAtual).toBe(0);
   });
 });
