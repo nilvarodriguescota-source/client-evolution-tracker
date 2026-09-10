@@ -35,7 +35,8 @@ const tresMeses = () =>
     ),
   );
 
-const nomes = (g: { nomes: string[] }) => g.nomes;
+/** Client names of a movement group, in the order the analysis returns them. */
+const nomes = (g: { clientes: { nome: string }[] }) => g.clientes.map((c) => c.nome);
 
 describe("transições mês a mês", () => {
   it("gera uma transição para cada par de meses consecutivos", () => {

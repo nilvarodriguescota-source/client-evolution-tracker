@@ -16,11 +16,19 @@ function buildWorkbook(
 ): ArrayBuffer {
   const wb = XLSX.utils.book_new();
 
+  // The client code is the client's identity across tabs, so each name keeps the
+  // same code in every sheet — exactly as the ERP prints it.
+  const codigos = new Map<string, number>();
+  const codigo = (nome: string) => {
+    if (!codigos.has(nome)) codigos.set(nome, 100 + codigos.size);
+    return codigos.get(nome)!;
+  };
+
   for (const [sheetName, clientes] of Object.entries(periods)) {
     const produto = produtoPorAba[sheetName] ?? "PRODUTO A";
     const rows: (string | number | null)[][] = [];
-    clientes.forEach((nome, i) => {
-      rows.push([`Cliente: ${100 + i} - ${nome}`, null, null, null, null, null]);
+    clientes.forEach((nome) => {
+      rows.push([`Cliente: ${codigo(nome)} - ${nome}`, null, null, null, null, null]);
       rows.push(["Código", "Descrição", "Unidade", "Qtd", "Preço Médio", "Venda Bruta"]);
       // qty 2 x price 10 = 20
       rows.push(["5001", produto, "UN", 2, 10, 20]);

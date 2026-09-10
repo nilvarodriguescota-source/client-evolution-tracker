@@ -127,7 +127,18 @@ export function deslocarColunas(offset: number): ColumnMap {
 
 export interface CabecalhoCliente {
   codigo: string;
+  /** Client name alone — no dates, no phone numbers appended */
   nome: string;
+  /**
+   * Every "Rótulo: valor" the export appends to the client line, keyed by the
+   * normalised label ("data da ultima compra", "fone", "celular", …). Kept whole
+   * so nothing the report carries is thrown away.
+   */
+  campos: Record<string, string>;
+  /** Convenience readings of the fields the analysis uses by name */
+  dataUltimaCompra?: string;
+  fone?: string;
+  celular?: string;
   /** Column the "Cliente:" label was found in */
   coluna: number;
 }
@@ -149,10 +160,65 @@ const RE_CLIENTE = [
   /^clientes?\s*:?\s*()(.+)$/i,
 ];
 
-const RE_SUFIXO_DATA = new RegExp(
-  `\\s*[${TRACOS}]\\s*(data|periodo|período)\\s*:.*$`,
-  "i",
-);
+/** Splits on a dash that has spaces around it — "A - B", never "AB-10". */
+const RE_SEPARADOR = new RegExp(`\\s+[${TRACOS}]\\s+`);
+
+/** A trailing segment shaped like "Rótulo: valor". */
+const RE_CAMPO = /^([^:]{2,40}?)\s*:\s*(.*)$/;
+
+/** Field labels the analysis reads by name, in order of preference. */
+const ROTULOS = {
+  dataUltimaCompra: ["data da ultima compra", "data ultima compra", "ultima compra"],
+  fone: ["fone", "telefone", "tel"],
+  celular: ["celular", "cel", "whatsapp", "whats"],
+};
+
+function primeiroCampo(campos: Record<string, string>, rotulos: string[]): string | undefined {
+  for (const r of rotulos) {
+    const v = campos[r];
+    if (v) return v;
+  }
+  return undefined;
+}
+
+/**
+ * Splits the text after the client code into the name and the labelled fields
+ * the exports append to it:
+ *
+ *   "BRASA - Data da última compra: 08/09/2026 - Fone: (11) 3333-3333"
+ *   →  nome "BRASA", campos { "data da ultima compra": "08/09/2026", fone: "(11) 3333-3333" }
+ *
+ * Segments before the first labelled field stay in the name, so a client called
+ * "SUPER - MERCADO ZE" keeps its dash.
+ */
+export function separarCamposCliente(resto: string): {
+  nome: string;
+  campos: Record<string, string>;
+} {
+  const segmentos = resto.split(RE_SEPARADOR);
+  const campos: Record<string, string> = {};
+  let nome = segmentos[0].trim();
+  let rotuloAtual: string | null = null;
+
+  for (let i = 1; i < segmentos.length; i++) {
+    const seg = segmentos[i].trim();
+    if (!seg) continue;
+
+    const m = seg.match(RE_CAMPO);
+    if (m) {
+      rotuloAtual = normalizarTexto(m[1]);
+      campos[rotuloAtual] = m[2].trim();
+    } else if (rotuloAtual) {
+      // The value itself contained a spaced dash — put it back together.
+      campos[rotuloAtual] = `${campos[rotuloAtual]} - ${seg}`.trim();
+    } else {
+      // Still the name: no labelled field has started yet.
+      nome = `${nome} - ${seg}`;
+    }
+  }
+
+  return { nome: nome.trim(), campos };
+}
 
 /**
  * Finds the client header anywhere in the row — some exports indent the report
@@ -169,11 +235,19 @@ export function lerCabecalhoCliente(row: SheetRows[number]): CabecalhoCliente | 
       const match = bruto.match(re);
       if (!match) continue;
 
-      // Drop the trailing "- Data: 01/06/2025 a 30/06/2025" some exports append.
-      const nome = match[2].replace(RE_SUFIXO_DATA, "").trim();
+      // "NOME - Data da última compra: … - Fone: …" becomes a name plus fields.
+      const { nome, campos } = separarCamposCliente(match[2]);
       if (!nome) continue;
 
-      return { codigo: (match[1] ?? "").trim(), nome, coluna: col };
+      return {
+        codigo: (match[1] ?? "").trim(),
+        nome,
+        campos,
+        dataUltimaCompra: primeiroCampo(campos, ROTULOS.dataUltimaCompra),
+        fone: primeiroCampo(campos, ROTULOS.fone),
+        celular: primeiroCampo(campos, ROTULOS.celular),
+        coluna: col,
+      };
     }
   }
 
@@ -241,6 +315,12 @@ export function lerPeriodoDoNome(name: string): Periodo {
 const RE_RODAPE = /^(gerado|emitido|impresso|pagina|página)/i;
 
 /**
+ * "Data da última compra: 08/09/2026" is the client's own history, not the month
+ * the tab covers — it is removed before the period is read off the content.
+ */
+const RE_ULTIMA_COMPRA = /(data\s+d[ae]\s+)?[uú]ltima\s+compra\s*:\s*\d{1,2}\/\d{1,2}\/\d{2,4}/gi;
+
+/**
  * Reads the period out of the sheet content, for tabs whose name says nothing
  * ("Plan1", "Relatório (2)"). Looks for the date ranges the exports print in the
  * report title and in each client header.
@@ -251,7 +331,9 @@ export function lerPeriodoDoConteudo(rows: SheetRows): Periodo {
   for (const row of rows) {
     if (!row) continue;
     for (const cell of row) {
-      const texto = String(cell ?? "").trim();
+      const texto = String(cell ?? "")
+        .replace(RE_ULTIMA_COMPRA, " ")
+        .trim();
       if (!texto || RE_RODAPE.test(normalizarTexto(texto))) continue;
 
       // "01/06/2025 a 30/06/2025" or "Data: 01/06/2025"

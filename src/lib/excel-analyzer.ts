@@ -53,8 +53,21 @@ export interface ProductDetail {
 }
 
 export interface ClientData {
+  /**
+   * Identity across months: the client code when the report carries one, the
+   * normalised name otherwise. Never the raw header text — the exports append
+   * the client's last purchase date to it, which changes every month.
+   */
+  chave: string;
+  /** Client name alone, for display */
   nome: string;
   codigoCliente: string;
+  /** Last purchase date as printed by the report, e.g. "08/09/2026" */
+  dataUltimaCompra?: string;
+  fone?: string;
+  celular?: string;
+  /** Every labelled field the client line carries, by normalised label */
+  campos: Record<string, string>;
   produtos: ProductDetail[];
   totalGeral: number;
   /** Sum recalculated from products with full precision */
@@ -70,6 +83,7 @@ export interface PeriodData {
   nome: string;
   /** Tab name exactly as it appears in the file */
   sheetName: string;
+  /** Clients of the month, keyed by ClientData.chave */
   clientes: Map<string, ClientData>;
   totalFaturamento: number;
   /** Validation report for this period */
@@ -108,15 +122,29 @@ export interface ProductComparison {
   valorTotalPeriodo: number;
 }
 
+/** One client inside a movement group, with the fields the report carries. */
+export interface ClienteMovimento {
+  /** Identity across months */
+  chave: string;
+  nome: string;
+  codigoCliente?: string;
+  /** Last purchase date as printed by the report in the month of this movement */
+  dataUltimaCompra?: string;
+  fone?: string;
+  celular?: string;
+  /**
+   * Revenue of this client in the month the movement is measured in: the newer
+   * month for novos/retornados/mantidos, the older one for perdidos.
+   */
+  faturamento: number;
+}
+
 /** A set of clients moving between two consecutive months. */
 export interface GrupoClientes {
-  /** Client names, sorted */
-  nomes: string[];
+  /** One entry per client, sorted by name — never a single joined string */
+  clientes: ClienteMovimento[];
   total: number;
-  /**
-   * Revenue attached to the group: measured in the month the clients bought —
-   * the newer month for novos/retornados/mantidos, the older one for perdidos.
-   */
+  /** Sum of the clients' revenue in the month the group is measured in */
   faturamento: number;
 }
 
@@ -242,8 +270,14 @@ export type StatusCarteira =
   | "inativo";
 
 export interface ClienteCarteira {
+  /** Identity across months */
+  chave: string;
   nome: string;
   codigoCliente?: string;
+  /** Last purchase date as printed in the last month the client bought */
+  dataUltimaCompra?: string;
+  fone?: string;
+  celular?: string;
   status: StatusCarteira;
   ultimoPeriodo: string;
   totalPeriodosPresente: number;
@@ -366,6 +400,18 @@ function paraNumero(value: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+/**
+ * Identity of a client across months: the report's own client code when there is
+ * one, the normalised name otherwise. Keeping the raw header text out of this is
+ * what stops "BRASA - Data da última compra: 08/09/2026" from becoming a
+ * different client every month.
+ */
+function chaveDoCliente(codigo: string, nome: string): string {
+  const cod = codigo.trim();
+  if (cod) return `cod:${cod}`;
+  return `nome:${normalizarTexto(nome)}`;
+}
+
 /** Cell at `col`, or "" when the column is absent from this sheet. */
 function celula(row: SheetRows[number], col: number): unknown {
   return col === COLUNA_AUSENTE ? null : row[col];
@@ -426,6 +472,7 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
     const cliente = lerCabecalhoCliente(row);
     if (cliente) {
       const { codigo: codigoCliente, nome: nomeCliente, coluna } = cliente;
+      const chave = chaveDoCliente(codigoCliente, nomeCliente);
 
       // Layer 1: Existence — client code and name must exist
       validator.checkExistence(codigoCliente, excelRow, coluna, "codigoCliente");
@@ -438,25 +485,35 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
         });
       }
 
-      clientEntries.push({ key: nomeCliente, label: nomeCliente, row: excelRow });
+      clientEntries.push({ key: chave, label: nomeCliente, row: excelRow });
 
       // The same client can be listed twice in one tab (two report pages):
       // keep the first block and append to it instead of dropping the earlier rows.
-      const existente = clientes.get(nomeCliente);
+      const existente = clientes.get(chave);
       if (existente) {
         currentClient = existente;
         subtotais.get(existente)!.push(0);
+        // A later block may carry fields the first one did not print.
+        existente.campos = { ...cliente.campos, ...existente.campos };
+        existente.dataUltimaCompra ??= cliente.dataUltimaCompra;
+        existente.fone ??= cliente.fone;
+        existente.celular ??= cliente.celular;
       } else {
         currentClient = {
+          chave,
           nome: nomeCliente,
           codigoCliente,
+          dataUltimaCompra: cliente.dataUltimaCompra,
+          fone: cliente.fone,
+          celular: cliente.celular,
+          campos: cliente.campos,
           produtos: [],
           totalGeral: 0,
           totalRecalculado: 0,
           totalConsistente: true,
           origemLinha: excelRow,
         };
-        clientes.set(nomeCliente, currentClient);
+        clientes.set(chave, currentClient);
         subtotais.set(currentClient, [0]);
       }
       continue;
@@ -723,19 +780,18 @@ function tendenciaDaSerie(valores: number[]): { tendencia: Tendencia; variacao: 
 
 function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
   const n = periodos.length;
-  const allClients = new Map<string, { indicesPresente: number[]; codigoCliente?: string }>();
+  // Keyed by client identity, never by the raw header text.
+  const allClients = new Map<string, { indicesPresente: number[] }>();
 
   for (let i = 0; i < n; i++) {
-    for (const [nome, client] of periodos[i].clientes) {
-      if (!allClients.has(nome)) {
-        allClients.set(nome, { indicesPresente: [], codigoCliente: client.codigoCliente });
-      }
-      allClients.get(nome)!.indicesPresente.push(i);
+    for (const chave of periodos[i].clientes.keys()) {
+      if (!allClients.has(chave)) allClients.set(chave, { indicesPresente: [] });
+      allClients.get(chave)!.indicesPresente.push(i);
     }
   }
 
   const result: ClienteCarteira[] = [];
-  for (const [nome, data] of allClients) {
+  for (const [chave, data] of allClients) {
     const lastIdx = Math.max(...data.indicesPresente);
     // 0 = current period, 1 = one period back, etc.
     const distanceFromEnd = n - 1 - lastIdx;
@@ -755,7 +811,7 @@ function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
     // series instead of as a single snapshot.
     const faturamentoPorPeriodo: Record<string, number> = {};
     for (const p of periodos) {
-      faturamentoPorPeriodo[p.nome] = p.clientes.get(nome)?.totalGeral ?? 0;
+      faturamentoPorPeriodo[p.nome] = p.clientes.get(chave)?.totalGeral ?? 0;
     }
 
     // Measured between the client's own first and last purchase: a client that
@@ -763,17 +819,24 @@ function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
     const firstIdx = Math.min(...data.indicesPresente);
     const serie = periodos
       .slice(firstIdx, lastIdx + 1)
-      .map((p) => p.clientes.get(nome)?.totalGeral ?? 0);
+      .map((p) => p.clientes.get(chave)?.totalGeral ?? 0);
     const { tendencia, variacao: variacaoPeriodo } = tendenciaDaSerie(serie);
 
+    // Name and contact details as printed in the last month the client bought.
+    const ultimo = periodos[lastIdx].clientes.get(chave)!;
+
     result.push({
-      nome,
-      codigoCliente: data.codigoCliente,
+      chave,
+      nome: ultimo.nome,
+      codigoCliente: ultimo.codigoCliente || undefined,
+      dataUltimaCompra: ultimo.dataUltimaCompra,
+      fone: ultimo.fone,
+      celular: ultimo.celular,
       status,
       ultimoPeriodo: periodos[lastIdx].nome,
       totalPeriodosPresente: data.indicesPresente.length,
       periodosPresente: data.indicesPresente.map((i) => periodos[i].nome),
-      faturamentoUltimoPeriodo: periodos[lastIdx].clientes.get(nome)?.totalGeral ?? 0,
+      faturamentoUltimoPeriodo: ultimo.totalGeral,
       faturamentoPorPeriodo,
       variacaoPeriodo,
       tendencia,
@@ -794,11 +857,25 @@ function ticketMedio(periodo: PeriodData): number {
   return n > 0 ? preciseRound(periodo.totalFaturamento / n, 4) : 0;
 }
 
-function grupo(nomes: string[], faturamento: number): GrupoClientes {
+/** Turns a client of one month into a movement entry, keeping every field. */
+function movimento(cliente: ClientData): ClienteMovimento {
   return {
-    nomes: [...nomes].sort((a, b) => a.localeCompare(b, "pt-BR")),
-    total: nomes.length,
-    faturamento: preciseRound(faturamento, 4),
+    chave: cliente.chave,
+    nome: cliente.nome,
+    codigoCliente: cliente.codigoCliente || undefined,
+    dataUltimaCompra: cliente.dataUltimaCompra,
+    fone: cliente.fone,
+    celular: cliente.celular,
+    faturamento: preciseRound(cliente.totalGeral, 4),
+  };
+}
+
+function grupo(clientes: ClienteMovimento[]): GrupoClientes {
+  const ordenados = [...clientes].sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
+  return {
+    clientes: ordenados,
+    total: ordenados.length,
+    faturamento: preciseSum(ordenados.map((c) => c.faturamento)),
   };
 }
 
@@ -820,44 +897,40 @@ function compararPeriodos(periodos: PeriodData[]): TransicaoPeriodo[] {
     // Everyone seen before the previous month — tells novo from retornado.
     const vistoAntesDeDe = new Set<string>();
     for (let j = 0; j < i - 1; j++) {
-      for (const nome of periodos[j].clientes.keys()) vistoAntesDeDe.add(nome);
+      for (const chave of periodos[j].clientes.keys()) vistoAntesDeDe.add(chave);
     }
 
-    const novos: string[] = [];
-    const retornados: string[] = [];
-    const mantidos: string[] = [];
-    const perdidos: string[] = [];
+    const novos: ClienteMovimento[] = [];
+    const retornados: ClienteMovimento[] = [];
+    const mantidos: ClienteMovimento[] = [];
+    const perdidos: ClienteMovimento[] = [];
 
-    let fatNovos = 0;
-    let fatRetornados = 0;
-    let fatMantidos = 0;
-    let fatPerdidos = 0;
     let expansao = 0;
     let contracao = 0;
 
-    for (const [nome, cliente] of para.clientes) {
-      const anterior = de.clientes.get(nome);
+    for (const [chave, cliente] of para.clientes) {
+      const anterior = de.clientes.get(chave);
       if (anterior) {
-        mantidos.push(nome);
-        fatMantidos += cliente.totalGeral;
+        mantidos.push(movimento(cliente));
         const delta = cliente.totalGeral - anterior.totalGeral;
         if (delta >= 0) expansao += delta;
         else contracao += delta;
-      } else if (vistoAntesDeDe.has(nome)) {
-        retornados.push(nome);
-        fatRetornados += cliente.totalGeral;
+      } else if (vistoAntesDeDe.has(chave)) {
+        retornados.push(movimento(cliente));
       } else {
-        novos.push(nome);
-        fatNovos += cliente.totalGeral;
+        novos.push(movimento(cliente));
       }
     }
 
-    for (const [nome, cliente] of de.clientes) {
-      if (!para.clientes.has(nome)) {
-        perdidos.push(nome);
-        fatPerdidos += cliente.totalGeral;
-      }
+    // Measured in the month they last bought — the month they are leaving.
+    for (const [chave, cliente] of de.clientes) {
+      if (!para.clientes.has(chave)) perdidos.push(movimento(cliente));
     }
+
+    const gNovos = grupo(novos);
+    const gRetornados = grupo(retornados);
+    const gMantidos = grupo(mantidos);
+    const gPerdidos = grupo(perdidos);
 
     const diferenca = preciseRound(para.totalFaturamento - de.totalFaturamento, 4);
     const tmDe = ticketMedio(de);
@@ -876,16 +949,16 @@ function compararPeriodos(periodos: PeriodData[]): TransicaoPeriodo[] {
       ticketMedioDe: tmDe,
       ticketMedioPara: tmPara,
       variacaoTicketMedio: variacao(tmDe, tmPara),
-      novos: grupo(novos, fatNovos),
-      retornados: grupo(retornados, fatRetornados),
-      mantidos: grupo(mantidos, fatMantidos),
-      perdidos: grupo(perdidos, fatPerdidos),
+      novos: gNovos,
+      retornados: gRetornados,
+      mantidos: gMantidos,
+      perdidos: gPerdidos,
       ponte: {
-        novos: preciseRound(fatNovos, 4),
-        retornados: preciseRound(fatRetornados, 4),
+        novos: gNovos.faturamento,
+        retornados: gRetornados.faturamento,
         expansao: preciseRound(expansao, 4),
         contracao: preciseRound(contracao, 4),
-        perdidos: preciseRound(-fatPerdidos, 4),
+        perdidos: preciseRound(-gPerdidos.faturamento, 4),
         total: diferenca,
       },
       taxaRetencao:

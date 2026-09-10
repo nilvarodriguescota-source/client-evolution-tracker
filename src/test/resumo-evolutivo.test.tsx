@@ -109,22 +109,24 @@ describe("Resumo evolutivo · 3 meses", () => {
     renderAnalise(TRES);
     abrirAba(/Clientes Novos/);
 
-    const linhaJulho = screen.getByRole("row", { name: /junho → julho/ });
-    expect(within(linhaJulho).getByText("GAMA")).toBeInTheDocument();
+    // uma tabela por passagem de mês, cada cliente em sua própria linha
+    const [junhoJulho, julhoAgosto] = screen.getAllByRole("table");
 
-    const linhaAgosto = screen.getByRole("row", { name: /julho → agosto/ });
-    // DELTA entrou como novo e BETA voltou
-    expect(within(linhaAgosto).getByText(/DELTA/)).toBeInTheDocument();
-    expect(within(linhaAgosto).getByText(/BETA/)).toBeInTheDocument();
+    expect(within(junhoJulho).getByRole("row", { name: /GAMA/ })).toBeInTheDocument();
+
+    const delta = within(julhoAgosto).getByRole("row", { name: /DELTA/ });
+    expect(within(delta).getByText("Novo")).toBeInTheDocument();
+    const beta = within(julhoAgosto).getByRole("row", { name: /BETA/ });
+    expect(within(beta).getByText("Retorno")).toBeInTheDocument();
   });
 
   it("lista quem saiu em cada mês na aba Clientes Perdidos", () => {
     renderAnalise(TRES);
     abrirAba(/Clientes Perdidos/);
 
-    const linhaJulho = screen.getByRole("row", { name: /junho → julho/ });
-    expect(within(linhaJulho).getByText("BETA")).toBeInTheDocument();
-    expect(within(linhaJulho).getByText("R$ 200,00")).toBeInTheDocument();
+    const [junhoJulho] = screen.getAllByRole("table");
+    const beta = within(junhoJulho).getByRole("row", { name: /BETA/ });
+    expect(within(beta).getByText("R$ 200,00")).toBeInTheDocument();
   });
 });
 
