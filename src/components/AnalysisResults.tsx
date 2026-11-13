@@ -741,138 +741,11 @@ export function AnalysisResults({ result }: Props) {
 
         {/* Validation Report Tab */}
         <TabsContent value="validacao" className="space-y-4">
-          {/* What was read from the file, tab by tab */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <FileSpreadsheet className="h-4 w-4 text-primary" /> Leitura do arquivo ·{" "}
-                {result.leitura.abasLidas.length} de {result.leitura.abasNoArquivo.length} abas
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="p-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Aba</TableHead>
-                    <TableHead>Período</TableHead>
-                    <TableHead>Identificado por</TableHead>
-                    <TableHead className="text-right">Linhas</TableHead>
-                    <TableHead className="text-right">Clientes</TableHead>
-                    <TableHead className="text-right">Funcionários</TableHead>
-                    <TableHead className="text-right">Produtos</TableHead>
-                    <TableHead className="text-right">Faturamento</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {result.periodos.map((p) => (
-                    <TableRow key={p.sheetName}>
-                      <TableCell className="font-medium">
-                        {p.sheetName}
-                        {p.oculta && (
-                          <Badge variant="outline" className="ml-2 text-muted-foreground">
-                            oculta
-                          </Badge>
-                        )}
-                      </TableCell>
-                      <TableCell>{p.nome}</TableCell>
-                      <TableCell className="text-muted-foreground">
-                        {origemPeriodoLabel(p.origemPeriodo)}
-                      </TableCell>
-                      <TableCell className="text-right">{p.linhasLidas}</TableCell>
-                      <TableCell
-                        className={`text-right ${p.clientes.size === 0 ? "font-semibold text-destructive" : ""}`}
-                      >
-                        {p.clientesCarteira.size}
-                      </TableCell>
-                      <TableCell className="text-right text-muted-foreground">{p.funcionarios.size}</TableCell>
-                      <TableCell className="text-right">{p.produtosLidos}</TableCell>
-                      <TableCell className="text-right">{fmt(p.totalFaturamento)}</TableCell>
-                    </TableRow>
-                  ))}
-                  {result.leitura.abasIgnoradas.map((a) => (
-                    <TableRow key={a.sheetName} className="text-muted-foreground">
-                      <TableCell className="font-medium">{a.sheetName}</TableCell>
-                      <TableCell colSpan={7}>Não lida — {a.motivo}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
-
-          {/* Spreadsheet × processed */}
+          {/* What the spreadsheet holds, month by month */}
           <ConferenciaCard result={result} />
 
           {/* Employees: in the revenue, out of the client analysis */}
           <FuncionariosCard result={result} />
-
-          {/* Layer summary */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <ShieldCheck className="h-4 w-4 text-primary" /> Resumo de Validação por Camada
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="p-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Camada</TableHead>
-                    <TableHead className="text-right">Aprovadas</TableHead>
-                    <TableHead className="text-right">Falhas</TableHead>
-                    <TableHead className="text-right">Total</TableHead>
-                    <TableHead className="text-right">Taxa</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {Object.entries(vr.layerSummary).map(([layer, counts]) => {
-                    const total = counts.passed + counts.failed;
-                    const rate = total > 0 ? (counts.passed / total) * 100 : 100;
-                    return (
-                      <TableRow key={layer}>
-                        <TableCell className="font-medium capitalize">{layerLabel(layer)}</TableCell>
-                        <TableCell className="text-right text-accent">{counts.passed}</TableCell>
-                        <TableCell className="text-right text-destructive">{counts.failed}</TableCell>
-                        <TableCell className="text-right">{total}</TableCell>
-                        <TableCell className="text-right">
-                          <Badge
-                            variant="outline"
-                            className={
-                              rate === 100
-                                ? "border-accent/30 bg-accent/10 text-accent"
-                                : rate >= 90
-                                ? "border-yellow-500/30 bg-yellow-500/10 text-yellow-600"
-                                : "border-destructive/30 bg-destructive/10 text-destructive"
-                            }
-                          >
-                            {rate.toFixed(1)}%
-                          </Badge>
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })}
-                  <TableRow className="font-semibold">
-                    <TableCell>Total</TableCell>
-                    <TableCell className="text-right text-accent">{vr.passedChecks}</TableCell>
-                    <TableCell className="text-right text-destructive">{vr.failedChecks}</TableCell>
-                    <TableCell className="text-right">{vr.totalChecks}</TableCell>
-                    <TableCell className="text-right">
-                      <Badge
-                        variant="outline"
-                        className={
-                          vr.valid
-                            ? "border-accent/30 bg-accent/10 text-accent"
-                            : "border-destructive/30 bg-destructive/10 text-destructive"
-                        }
-                      >
-                        {vr.totalChecks > 0 ? ((vr.passedChecks / vr.totalChecks) * 100).toFixed(1) : "100.0"}%
-                      </Badge>
-                    </TableCell>
-                  </TableRow>
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
 
           {/* Detailed diagnostics */}
           {vr.diagnostics.length > 0 && (
@@ -1589,8 +1462,8 @@ function ConferenciaCard({ result }: { result: AnalysisResult }) {
           Conferência dos dados da planilha
         </CardTitle>
         <p className="text-xs text-muted-foreground">
-          Números de cada aba, apurados somente das linhas de venda da planilha. A
-          quantidade vendida soma todas as colunas de quantidade dessas linhas, sem os
+          Números de cada mês, apurados somente das linhas de venda da planilha. A
+          quantidade vendida é a soma da coluna "Qtd. venda" de cada produto, sem os
           totais por cliente, por unidade ou da aba.
         </p>
       </CardHeader>
@@ -1599,8 +1472,7 @@ function ConferenciaCard({ result }: { result: AnalysisResult }) {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Aba</TableHead>
-                <TableHead className="text-right">Registros</TableHead>
+                <TableHead>Meses</TableHead>
                 <TableHead className="text-right">Clientes</TableHead>
                 <TableHead className="text-right">Funcionários</TableHead>
                 <TableHead className="text-right">Produtos</TableHead>
@@ -1611,13 +1483,9 @@ function ConferenciaCard({ result }: { result: AnalysisResult }) {
             <TableBody>
               {c.abas.map((a) => (
                 <TableRow key={a.aba}>
-                  <TableCell className="font-medium">
-                    {a.aba}
-                    {a.periodo !== a.aba && (
-                      <span className="ml-1 text-xs text-muted-foreground">({a.periodo})</span>
-                    )}
+                  <TableCell className="font-medium capitalize" title={`Aba "${a.aba}"`}>
+                    {a.periodo}
                   </TableCell>
-                  <TableCell className="text-right">{a.registrosVenda}</TableCell>
                   <TableCell className="text-right">{a.clientesCarteira}</TableCell>
                   <TableCell className="text-right text-muted-foreground">{a.funcionarios}</TableCell>
                   <TableCell className="text-right">{a.produtosDistintos}</TableCell>
@@ -1626,8 +1494,9 @@ function ConferenciaCard({ result }: { result: AnalysisResult }) {
                 </TableRow>
               ))}
               <TableRow className="font-semibold">
-                <TableCell>Janela · {c.consolidado.abas} abas</TableCell>
-                <TableCell className="text-right">{c.consolidado.registrosVenda}</TableCell>
+                <TableCell>
+                  Janela · {c.consolidado.abas} {c.consolidado.abas === 1 ? "mês" : "meses"}
+                </TableCell>
                 <TableCell className="text-right">{c.consolidado.clientesDistintos}</TableCell>
                 <TableCell className="text-right">{c.consolidado.funcionariosDistintos}</TableCell>
                 <TableCell className="text-right">{c.consolidado.produtosDistintos}</TableCell>
@@ -1707,17 +1576,6 @@ function FuncionariosCard({ result }: { result: AnalysisResult }) {
       </CardContent>
     </Card>
   );
-}
-
-function origemPeriodoLabel(origem: AnalysisResult["periodos"][number]["origemPeriodo"]): string {
-  switch (origem) {
-    case "nome-da-aba":
-      return "nome da aba";
-    case "conteudo":
-      return "conteúdo da aba";
-    default:
-      return "ordem no arquivo";
-  }
 }
 
 function layerLabel(layer: string): string {

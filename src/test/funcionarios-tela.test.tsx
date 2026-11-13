@@ -97,8 +97,7 @@ describe("tela · seis meses com funcionários", () => {
       .getAllByRole("columnheader")
       .map((h) => h.textContent);
     expect(cabecalhos).toEqual([
-      "Aba",
-      "Registros",
+      "Meses",
       "Clientes",
       "Funcionários",
       "Produtos",
@@ -106,6 +105,9 @@ describe("tela · seis meses com funcionários", () => {
       "Faturamento",
     ]);
     expect(screen.queryByText(/Subtotais impressos/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Leitura do arquivo/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("Resumo de Validação por Camada")).not.toBeInTheDocument();
+    expect(within(cartao).queryByText("Registros")).not.toBeInTheDocument();
     expect(screen.queryByText(/Total impresso/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/planilha × sistema/i)).not.toBeInTheDocument();
     expect(within(cartao).queryByText("Status")).not.toBeInTheDocument();

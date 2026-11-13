@@ -98,20 +98,16 @@ describe("AnalysisResults — os três meses chegam à tela", () => {
     expect(within(linhaGraxa).getByText("R$ 30,00")).toBeInTheDocument();
   });
 
-  it("presta contas da leitura de cada aba na aba Validação", () => {
+  it("mostra na aba Validação a conferência por mês, sem o quadro de leitura nem o resumo por camada", () => {
     renderAnalise();
     abrirAba(/Validação/);
 
-    expect(
-      screen.getAllByText(textoContinuo("Leitura do arquivo · 3 de 3 abas")).length,
-    ).toBeGreaterThan(0);
+    expect(screen.queryByText(textoContinuo("Leitura do arquivo"))).not.toBeInTheDocument();
+    expect(screen.queryByText("Resumo de Validação por Camada")).not.toBeInTheDocument();
 
-    // the "Leitura do arquivo" row (the conferência table has a junho row too)
-    const linhaJunho = screen
-      .getAllByRole("row", { name: /junho/ })
-      .find((r) => within(r).queryByText("nome da aba"))!;
-    expect(within(linhaJunho).getByText("nome da aba")).toBeInTheDocument();
-    // 2 clients and 2 products really processed out of the junho tab
+    const linhaJunho = screen.getAllByRole("row").find((r) => r.querySelector("td")?.textContent === "junho")!;
+    // junho: 2 clients, 2 products, 10 + 3 units, R$ 55,00
     expect(within(linhaJunho).getAllByText("2").length).toBeGreaterThanOrEqual(2);
+    expect(within(linhaJunho).getByText("13")).toBeInTheDocument();
   });
 });

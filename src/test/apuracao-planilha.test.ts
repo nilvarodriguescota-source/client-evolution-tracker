@@ -585,7 +585,7 @@ describe("regressões da leitura das linhas", () => {
 describe("quantidade vendida", () => {
   const qtd = (r: AnalysisResult, i = 0) => r.periodos[i].leituraAba.quantidadeTotal;
 
-  it("soma todas as colunas de quantidade vendida da planilha", () => {
+  it('usa somente a coluna "Qtd. venda" de cada produto', () => {
     const cab = ["Código", "Descrição", "UN", "Qtd. venda", "Qtd. bonificação", "Preço médio venda", "Venda bruta"];
     const r = analyzeWorkbook(
       abasCruas({
@@ -599,24 +599,24 @@ describe("quantidade vendida", () => {
         julho: abaSimples,
       }),
     );
-    expect(r.periodos[0].clientes.get("cod:1")!.produtos.map((p) => p.quantidade)).toEqual([12, 3]);
-    expect(qtd(r)).toBe(15);
+    expect(r.periodos[0].clientes.get("cod:1")!.produtos.map((p) => p.quantidade)).toEqual([10, 3]);
+    expect(qtd(r)).toBe(13);
+    expect(r.evolucaoPeriodos[0].quantidade).toBe(13);
+    expect(r.conferencia.abas[0].quantidadeTotal).toBe(13);
     expect(r.periodos[0].totalFaturamento).toBe(62);
-    // the unit price refers to "Qtd. venda": 10 × 5 = 50 is consistent
     expect(r.inconsistencias).toEqual([]);
   });
 
-  it("não soma colunas que não são unidades vendidas nem valores em dinheiro", () => {
-    const cab = ["Código", "Descrição", "Qtd. venda", "Qtd. devolvida", "Preço médio", "Venda bruta", "Qtd. total"];
+  it('prefere a coluna "Qtd. venda" mesmo quando outra coluna de quantidade vem antes', () => {
+    const cab = ["Código", "Descrição", "Qtd. embalagem", "Qtde. caixa", "Qtd. venda", "Qtd. devolvida", "Preço médio", "Venda bruta"];
     const r = analyzeWorkbook(
       abasCruas({
-        junho: [["Cliente: 1 - A"], cab, ["10", "X", 4, 1, 10, 40, 4]],
+        junho: [["Cliente: 1 - A"], cab, ["10", "X", 12, 2, 4, 1, 10, 40]],
         julho: abaSimples,
       }),
     );
-    // "Qtd. total" is units and is summed; "Qtd. devolvida" is not a sale;
-    // "Venda bruta" stays the value column — never the units.
-    expect(qtd(r)).toBe(8);
+    // never a money column, never another quantity column
+    expect(qtd(r)).toBe(4);
     expect(r.periodos[0].totalFaturamento).toBe(40);
   });
 

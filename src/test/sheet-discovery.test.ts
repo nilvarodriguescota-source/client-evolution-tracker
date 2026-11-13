@@ -56,13 +56,13 @@ describe("lerCabecalhoProdutos", () => {
   it("mapeia as colunas pelo rótulo, em qualquer ordem", () => {
     expect(
       lerCabecalhoProdutos(["Descrição", "Código", "Qtd. venda", "Venda bruta", "Preço médio venda", "UN"]),
-    ).toEqual({ descricao: 0, codigo: 1, quantidade: 2, quantidades: [2], vendaBruta: 3, precoMedio: 4, unidade: 5 });
+    ).toEqual({ descricao: 0, codigo: 1, quantidade: 2, vendaBruta: 3, precoMedio: 4, unidade: 5 });
   });
 
   it("aceita rótulos alternativos e colunas deslocadas", () => {
     expect(
       lerCabecalhoProdutos([null, "Cod.", "Produto", "Unid", "Quantidade", "Preço médio", "Valor total"]),
-    ).toEqual({ codigo: 1, descricao: 2, unidade: 3, quantidade: 4, quantidades: [4], precoMedio: 5, vendaBruta: 6 });
+    ).toEqual({ codigo: 1, descricao: 2, unidade: 3, quantidade: 4, precoMedio: 5, vendaBruta: 6 });
   });
 
   it("marca como ausente a coluna que o relatório não traz", () => {
