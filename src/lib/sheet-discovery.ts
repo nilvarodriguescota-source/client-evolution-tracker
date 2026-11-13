@@ -15,6 +15,7 @@
  */
 
 import * as XLSX from "xlsx";
+import { ehNumero } from "./numero-br";
 
 export type SheetRows = (string | number | boolean | null)[][];
 
@@ -68,7 +69,8 @@ export const COLUNA_AUSENTE = -1;
 const PADROES_CABECALHO: { field: keyof ColumnMap; test: RegExp }[] = [
   { field: "codigo", test: /^(cod|codigo|cod\.)/ },
   { field: "descricao", test: /^(desc|produto|mercadoria|item)/ },
-  { field: "unidade", test: /^(un|unid)/ },
+  // "UN", "Und.", "Unid", "Unidade" — never "Unitário", which is a price.
+  { field: "unidade", test: /^(un|und|unid|unidade|unid\.? medida)\.?$/ },
   { field: "quantidade", test: /(qtd|qtde|quant)/ },
   { field: "precoMedio", test: /(preco|prc|vlr\.? unit|valor unit)/ },
   { field: "vendaBruta", test: /(venda bruta|vlr\.? bruto|valor bruto|vlr\.? total|valor total|faturamento|total)/ },
@@ -141,6 +143,17 @@ export interface CabecalhoCliente {
   celular?: string;
   /** Column the "Cliente:" label was found in */
   coluna: number;
+  /**
+   * The identification starts with "*" ("Cliente: 123 - *MARIA SILVA",
+   * "Cliente: *MARIA SILVA"): an employee buying at the company. Their purchases
+   * count as sales; they are left out of every client-portfolio analysis.
+   */
+  funcionario: boolean;
+}
+
+/** "*MARIA", "* MARIA", code "*123": the asterisk that marks an employee. */
+export function ehFuncionario(codigo: string, nome: string): boolean {
+  return /^\*/.test(codigo.trim()) || /^\*/.test(nome.trim());
 }
 
 /**
@@ -228,8 +241,24 @@ export function lerCabecalhoCliente(row: SheetRows[number]): CabecalhoCliente | 
   if (!row) return null;
 
   for (let col = 0; col < row.length; col++) {
-    const bruto = String(row[col] ?? "").trim();
-    if (!bruto || !/^clientes?\s*:/i.test(bruto)) continue;
+    const celula = String(row[col] ?? "").trim();
+    if (!celula || !/^clientes?\s*:/i.test(celula)) continue;
+
+    // Some exports put "Cliente:" in one cell and "1001 - NOME" (and the
+    // labelled fields) in the cells to its right. The text cells that follow are
+    // part of the same line; numbers (a total printed on the header row) are not.
+    const seguintes: string[] = [];
+    for (let c = col + 1; c < row.length; c++) {
+      const v = row[c];
+      if (v === null || v === undefined || typeof v === "number" || typeof v === "boolean") continue;
+      const t = String(v).trim();
+      if (t && !ehNumero(t)) seguintes.push(t);
+    }
+    const bruto = /^clientes?\s*:?\s*$/i.test(celula)
+      ? `${celula} ${seguintes.join(" - ")}`.trim()
+      : seguintes.length && seguintes.some((t) => /:/.test(t))
+        ? `${celula} - ${seguintes.join(" - ")}`
+        : celula;
 
     for (const re of RE_CLIENTE) {
       const match = bruto.match(re);
@@ -239,9 +268,11 @@ export function lerCabecalhoCliente(row: SheetRows[number]): CabecalhoCliente | 
       const { nome, campos } = separarCamposCliente(match[2]);
       if (!nome) continue;
 
+      const codigo = (match[1] ?? "").trim();
       return {
-        codigo: (match[1] ?? "").trim(),
+        codigo,
         nome,
+        funcionario: ehFuncionario(codigo, nome),
         campos,
         dataUltimaCompra: primeiroCampo(campos, ROTULOS.dataUltimaCompra),
         fone: primeiroCampo(campos, ROTULOS.fone),
@@ -464,6 +495,12 @@ export interface DescobertaPlanilha {
   ignoradas: AbaIgnorada[];
   /** Every tab name in the file, in file order */
   todasAsAbas: string[];
+  /**
+   * Tabs that cover the same month. Each one is still read (nothing is dropped
+   * silently), but the month would be counted twice in the window — the
+   * analysis reports it as an error.
+   */
+  periodosRepetidos: { periodo: string; abas: string[] }[];
 }
 
 /**
@@ -474,7 +511,12 @@ export interface DescobertaPlanilha {
  * Wrapping in a Uint8Array parses every sheet correctly for both .xls and .xlsx.
  */
 export function lerPastaDeTrabalho(buffer: ArrayBuffer): XLSX.WorkBook {
-  return XLSX.read(new Uint8Array(buffer), { type: "array" });
+  // raw: many ERPs save the ".xls" as an HTML or text table. Without `raw`,
+  // SheetJS guesses the numbers in US format and "4.200,00" comes back as 4.2,
+  // "123,45" as 12345. With it the cells stay as printed and every number is
+  // read by lerNumero, in the Brazilian format. Binary .xls/.xlsx cells are
+  // already typed and are not affected.
+  return XLSX.read(new Uint8Array(buffer), { type: "array", raw: true });
 }
 
 function linhasDaAba(sheet: XLSX.WorkSheet): SheetRows {
@@ -580,9 +622,32 @@ export function descobrirAbas(wb: XLSX.WorkBook): DescobertaPlanilha {
     });
   });
 
+  // Two tabs that cover the same month.
+  const porPeriodo = new Map<string, AbaDescoberta[]>();
+  for (const a of abas) {
+    if (a.mes === undefined) continue;
+    const chave = `${a.ano ?? "?"}-${a.mes}`;
+    porPeriodo.set(chave, [...(porPeriodo.get(chave) ?? []), a]);
+  }
+  const periodosRepetidos = [...porPeriodo.values()]
+    .filter((grupo) => grupo.length > 1)
+    .map((grupo) => ({
+      periodo: rotularPeriodo(grupo[0]) ?? grupo[0].nome,
+      abas: grupo.map((a) => a.sheetName),
+    }));
+
+  // The label is the key of every per-month column, chart series and record:
+  // two tabs must never share it, or one month would overwrite the other.
+  const usados = new Set<string>();
+  for (const a of abas) {
+    if (usados.has(a.nome)) a.nome = `${a.nome} (${a.sheetName})`;
+    usados.add(a.nome);
+  }
+
   return {
     abas: ordenarPorPeriodo(abas),
     ignoradas,
     todasAsAbas: [...wb.SheetNames],
+    periodosRepetidos,
   };
 }

@@ -41,6 +41,8 @@ export interface AbaFixture {
   cabecalhoDeProdutos?: string[];
   /** Extra blank columns before the report (indented exports) */
   recuo?: number;
+  /** Overrides the printed "Totais por unidade" value (to simulate a divergence) */
+  totalImpresso?: number;
 }
 
 const CABECALHO_PADRAO = [
@@ -62,6 +64,8 @@ export function abaRelatorio(aba: AbaFixture): Rows {
   const rows: Rows = [];
   rows.push(pad(["Vendas de produto no período"]));
   rows.push([]);
+  // What the tab adds up to, per unit — printed at the end, as the ERP does.
+  const porUnidade = new Map<string, { qtd: number; valor: number }>();
 
   for (const cliente of aba.clientes) {
     // The exports append labelled fields to the client line, in this order.
@@ -81,6 +85,10 @@ export function abaRelatorio(aba: AbaFixture): Rows {
       soma += total;
       quantidade += item.qtd;
       rows.push(pad([item.codigo, item.produto, "UN", item.qtd, item.preco, total]));
+      const u = porUnidade.get("UN") ?? { qtd: 0, valor: 0 };
+      u.qtd += item.qtd;
+      u.valor += total;
+      porUnidade.set("UN", u);
     }
 
     rows.push(pad([null, null, null, quantidade, null, cliente.subtotal ?? Number(soma.toFixed(2))]));
@@ -88,7 +96,10 @@ export function abaRelatorio(aba: AbaFixture): Rows {
   }
 
   rows.push(pad(["Totais por unidade:"]));
-  rows.push(pad(["UN", null, null, 0, null, 0]));
+  if (porUnidade.size === 0) rows.push(pad(["UN", null, null, 0, null, 0]));
+  for (const [un, t] of porUnidade) {
+    rows.push(pad([un, null, null, Number(t.qtd.toFixed(4)), null, aba.totalImpresso ?? Number(t.valor.toFixed(2))]));
+  }
   rows.push(pad(["Gerado em 05/09/2025 14:32"]));
   return rows;
 }

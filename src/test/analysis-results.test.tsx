@@ -106,7 +106,10 @@ describe("AnalysisResults — os três meses chegam à tela", () => {
       screen.getAllByText(textoContinuo("Leitura do arquivo · 3 de 3 abas")).length,
     ).toBeGreaterThan(0);
 
-    const linhaJunho = screen.getByRole("row", { name: /junho/ });
+    // the "Leitura do arquivo" row (the conferência table has a junho row too)
+    const linhaJunho = screen
+      .getAllByRole("row", { name: /junho/ })
+      .find((r) => within(r).queryByText("nome da aba"))!;
     expect(within(linhaJunho).getByText("nome da aba")).toBeInTheDocument();
     // 2 clients and 2 products really processed out of the junho tab
     expect(within(linhaJunho).getAllByText("2").length).toBeGreaterThanOrEqual(2);
