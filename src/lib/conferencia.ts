@@ -7,8 +7,8 @@
  * conferir os números com a própria planilha.
  *
  *   - registros de venda: uma linha de produto de um cliente;
- *   - quantidade vendida: soma de todas as colunas de quantidade dessas linhas,
- *     sem as linhas de total (do cliente, por unidade ou da aba);
+ *   - quantidade vendida: soma da coluna "Qtd. venda" de cada produto dessas
+ *     linhas, sem as linhas de total (do cliente, por unidade ou da aba);
  *   - faturamento: soma da "Venda bruta" dessas mesmas linhas.
  */
 
@@ -25,7 +25,7 @@ export interface ConferenciaAba {
   clientesCarteira: number;
   funcionarios: number;
   produtosDistintos: number;
-  /** Unidades vendidas: todas as colunas de quantidade das linhas de venda */
+  /** Unidades vendidas: soma da coluna "Qtd. venda" de cada produto */
   quantidadeTotal: number;
   /** Soma da "Venda bruta" das linhas de venda */
   faturamento: number;

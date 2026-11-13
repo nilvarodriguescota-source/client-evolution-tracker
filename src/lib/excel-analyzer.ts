@@ -89,7 +89,7 @@ export interface ClientData {
 export interface LeituraAba {
   /** Sale rows read (one per product line of a client) */
   registrosVenda: number;
-  /** Units sold: Σ of every quantity column over the sale rows only */
+  /** Units sold: Σ of the "Qtd. venda" column over the sale rows only */
   quantidadeTotal: number;
   produtosDistintos: number;
   /** Σ "Venda bruta" of the sale rows — the revenue of the tab */
@@ -262,7 +262,7 @@ export interface PeriodoResumo {
   /** Revenue the perdidos had in the previous month */
   faturamentoPerdidos: number | null;
   taxaRetencao: number | null;
-  /** Units sold in the month (every quantity column of the sale rows) */
+  /** Units sold in the month: Σ "Qtd. venda" of the product rows */
   quantidade: number;
   /** % change of the units sold vs the previous month; null on the first month */
   variacaoQuantidade: number | null;
@@ -559,7 +559,7 @@ function ehSomaDoCliente(
  * that is reported. Nothing is dropped silently.
  *
  * The revenue of a client is the sum of its sale rows ("Venda bruta"); the
- * units sold are the sum of every quantity column of those same rows.
+ * units sold are the sum of the "Qtd. venda" column of those same rows.
  */
 function parsePeriod(aba: AbaDescoberta): PeriodData {
   const { rows, nome } = aba;
@@ -673,10 +673,8 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
 
     const codigo = texto(row, colunas.codigo);
     const descricao = texto(row, colunas.descricao);
-    // Units sold on the row: every quantity column of the header, summed.
-    const qtds = colunas.quantidades.map((c) => lerNumero(celula(row, c)));
-    const qtdLida = qtds.some((q) => q !== null) ? somarValores(qtds.map((q) => q ?? 0)) : null;
-    const qtdPrincipal = lerNumero(celula(row, colunas.quantidade));
+    // Units sold on the row: the "Qtd. venda" column of the product.
+    const qtdLida = lerNumero(celula(row, colunas.quantidade));
     const vendaLida = lerNumero(celula(row, colunas.vendaBruta));
     const temValor = qtdLida !== null || vendaLida !== null;
 
@@ -803,10 +801,9 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
       validator.checkType(celula(row, colunas.precoMedio), "number", excelRow, colunas.precoMedio, "precoMedio");
     }
 
-    // Units sold: the sum of every quantity column of the row.
+    // Units sold: the "Qtd. venda" of the product row.
     const quantidade = qtdLida ?? 0;
-    // The average price refers to the first quantity column ("Qtd. venda").
-    const quantidadePrincipal = qtdPrincipal ?? 0;
+    const quantidadePrincipal = quantidade;
     const vendaBruta = vendaLida ?? 0;
     // Without a unit-price column the average price is derived, never invented.
     const precoMedio =
