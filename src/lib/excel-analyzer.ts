@@ -12,6 +12,8 @@ import {
   type ColumnMap,
   type SheetRows,
 } from "./sheet-discovery";
+import { lerNumero, ehNumero, paraNumero, somarValores } from "./numero-br";
+import { conferirAnalise, type Conferencia } from "./conferencia";
 import {
   ExcelValidator,
   preciseMultiply,
@@ -76,6 +78,35 @@ export interface ClientData {
   totalConsistente: boolean;
   /** Origin of client header row */
   origemLinha: number;
+  /**
+   * Identification starts with "*": an employee. Counts in revenue, products and
+   * sales figures; never in new/lost clients, portfolio or retention.
+   */
+  funcionario: boolean;
+  /**
+   * Sum of the subtotals the report printed for this client, or null when no
+   * block of the client printed one. Used only to check the revenue — the
+   * revenue itself is the sum of the sale rows.
+   */
+  subtotalImpresso: number | null;
+}
+
+/** Raw-level account of one tab: what the sheet printed and where every value went. */
+export interface LeituraAba {
+  /** Sale rows read (one per product line of a client) */
+  registrosVenda: number;
+  quantidadeTotal: number;
+  produtosDistintos: number;
+  /** Σ "Venda bruta" of the sale rows — the revenue of the tab */
+  faturamentoRegistros: number;
+  /** Σ of the printed client subtotals, when the tab prints them */
+  subtotaisImpressos: number | null;
+  /** Revenue of the client blocks that printed a subtotal (to compare with the above) */
+  faturamentoBlocosComSubtotal: number;
+  /** Total the tab itself prints ("Totais por unidade", "Total geral"), when it does */
+  totalImpresso: { valor: number; origem: string; linha: number } | null;
+  /** Rows carrying a value that could not be placed as a sale, subtotal or total */
+  linhasDescartadas: { linha: number; motivo: string; valor: number }[];
 }
 
 export interface PeriodData {
@@ -83,9 +114,23 @@ export interface PeriodData {
   nome: string;
   /** Tab name exactly as it appears in the file */
   sheetName: string;
-  /** Clients of the month, keyed by ClientData.chave */
+  /**
+   * Every buyer of the month, employees included, keyed by ClientData.chave.
+   * The revenue and product figures are built from this map.
+   */
   clientes: Map<string, ClientData>;
+  /** Buyers of the month that are clients of the portfolio (no employees) */
+  clientesCarteira: Map<string, ClientData>;
+  /** Employees ("*" in the identification) that bought in the month */
+  funcionarios: Map<string, ClientData>;
+  /** Revenue of the month: Σ of every sale row of the tab, employees included */
   totalFaturamento: number;
+  /** Revenue of the portfolio clients only */
+  faturamentoCarteira: number;
+  /** Revenue of the employees' purchases */
+  faturamentoFuncionarios: number;
+  /** What the tab printed and where every value went */
+  leituraAba: LeituraAba;
   /** Validation report for this period */
   validationReport: ValidationReport;
   /** How the period was identified */
@@ -100,6 +145,8 @@ export interface PeriodData {
 }
 
 export interface ProductComparison {
+  /** Identity of the product: code + normalised description */
+  chave: string;
   produto: string;
   codigo: string;
   qtdAnterior: number;
@@ -188,6 +235,11 @@ export interface TransicaoPeriodo {
     contracao: number;
     /** Revenue the clients that stopped buying used to bring (negative) */
     perdidos: number;
+    /**
+     * Change in the employees' purchases. They are revenue but not clients, so
+     * they get their own part and the bridge still closes on the month's change.
+     */
+    funcionarios: number;
     total: number;
   };
   /** mantidos ÷ clientes do mês anterior, em % */
@@ -221,6 +273,20 @@ export interface PeriodoResumo {
   /** Revenue the perdidos had in the previous month */
   faturamentoPerdidos: number | null;
   taxaRetencao: number | null;
+  /** Employees that bought in the month — outside the client count */
+  funcionarios: number;
+  /** Their purchases — inside `faturamento` */
+  faturamentoFuncionarios: number;
+}
+
+/** An employee ("*") with their purchases, kept apart from the client analysis. */
+export interface FuncionarioResumo {
+  chave: string;
+  nome: string;
+  codigoCliente?: string;
+  faturamentoPorPeriodo: Record<string, number>;
+  faturamentoTotal: number;
+  periodosPresente: string[];
 }
 
 export type Tendencia = "crescimento" | "queda" | "estavel";
@@ -350,6 +416,10 @@ export interface AnalysisResult {
   transicoes: TransicaoPeriodo[];
   /** The whole window read as a single movement */
   evolucaoConsolidada: EvolucaoConsolidada;
+  /** Employees found in the file, with their purchases (counted in revenue) */
+  funcionarios: FuncionarioResumo[];
+  /** Spreadsheet × processed figures, tab by tab and for the whole window */
+  conferencia: Conferencia;
   /** Combined validation report from all layers */
   validationReport: ValidationReport;
 }
@@ -360,18 +430,27 @@ export interface AnalysisResult {
 
 /** Tolerance for math checks (in currency units) */
 const MATH_TOLERANCE = 0.01;
-/** Tolerance for aggregation checks */
-const AGGREGATION_TOLERANCE = 0.05;
+/**
+ * The "Preço médio" column is an average printed with a few decimals: qty ×
+ * printed price can be off by up to half a cent per unit without anything being
+ * wrong with the sale. The check tolerates exactly that rounding, nothing more.
+ */
+const ARREDONDAMENTO_PRECO_POR_UNIDADE = 0.005;
+/** Tolerance for aggregation checks (printed subtotal × sum of the rows) */
+const AGGREGATION_TOLERANCE = 0.01;
 
-/** Product codes seen in the exports: "5001", "PA-001", "12.345", "AB/2" */
-const RE_CODIGO_PRODUTO = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+/** "Total geral", "Total do relatório": a total of the whole tab. */
+const RE_TOTAL_DA_ABA = /^(total geral|valor total geral|total do relatorio|total da aba|total do periodo)/;
+/** "Totais por unidade:" — the block of per-unit totals that closes the tab. */
+const RE_TOTAIS = /^totais?\b/;
 
 /**
  * Lines that close the current client block: whatever comes after them
  * ("Totais por unidade" and its per-unit rows) is no longer that client's
  * products.
  */
-const RE_FIM_DE_BLOCO = /^(totais?\b|total geral|subtotal|quantidade total|valor total geral)/;
+const RE_FIM_DE_BLOCO =
+  /^(totais?\b|total\b|sub-?\s?total|quantidade total|valor total geral)/;
 
 /**
  * Page furniture. Skipped without closing the block — a paginated export prints
@@ -383,22 +462,6 @@ const RE_LINHA_IGNORADA =
 // ---------------------------------------------------------------------------
 // Row helpers
 // ---------------------------------------------------------------------------
-
-function ehNumero(value: unknown): boolean {
-  if (typeof value === "number") return Number.isFinite(value);
-  const texto = String(value ?? "").trim();
-  if (!texto) return false;
-  // "1.234,56" and "1234.56" both show up depending on the export
-  return Number.isFinite(Number(texto.replace(/\./g, "").replace(",", ".")));
-}
-
-function paraNumero(value: unknown): number {
-  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
-  const texto = String(value ?? "").trim();
-  if (!texto) return 0;
-  const n = Number(texto.replace(/\s/g, "").replace(/\./g, "").replace(",", "."));
-  return Number.isFinite(n) ? n : 0;
-}
 
 /**
  * Identity of a client across months: the report's own client code when there is
@@ -412,9 +475,29 @@ function chaveDoCliente(codigo: string, nome: string): string {
   return `nome:${normalizarTexto(nome)}`;
 }
 
+/**
+ * Identity of a product: its code plus its description, normalised. Spacing,
+ * casing and accents in the description no longer split one product in two,
+ * and two products sharing a description but not a code stay apart.
+ */
+export function chaveDoProduto(codigo: string, descricao: string): string {
+  return `${codigo.trim()}|${normalizarTexto(descricao)}`;
+}
+
 /** Cell at `col`, or "" when the column is absent from this sheet. */
 function celula(row: SheetRows[number], col: number): unknown {
   return col === COLUNA_AUSENTE ? null : row[col];
+}
+
+/** Trimmed text of the cell at `col`. */
+function texto(row: SheetRows[number], col: number): string {
+  return String(celula(row, col) ?? "").trim();
+}
+
+/** A label that is a total, a subtotal or page furniture — never a product. */
+function ehRotulo(valor: string): boolean {
+  const t = normalizarTexto(valor);
+  return RE_FIM_DE_BLOCO.test(t) || RE_LINHA_IGNORADA.test(t);
 }
 
 /** First cell of the row that holds text — used to spot summary lines. */
@@ -436,6 +519,13 @@ function primeiroTexto(row: SheetRows[number]): string {
  * The tab is read through the layout discovered for it, not through fixed column
  * indices, so an export that indents the report or renames a column still gets
  * read instead of coming back empty.
+ *
+ * Every row that carries a value ends up in exactly one place: a sale row of a
+ * client, a printed subtotal, a printed total of the tab, or the list of
+ * discarded rows — which the conferência reports. Nothing is dropped silently.
+ *
+ * The revenue of a client is the sum of its sale rows ("Venda bruta"). The
+ * subtotals and totals the report prints are kept only to check that sum.
  */
 function parsePeriod(aba: AbaDescoberta): PeriodData {
   const { rows, nome } = aba;
@@ -444,16 +534,37 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
   const clientes = new Map<string, ClientData>();
   let currentClient: ClientData | null = null;
   /**
-   * Reported subtotal of each block of a client — a client listed on two report
-   * pages has two blocks, and its total is the sum of both, not the last one.
+   * Blocks of each client — a client listed on two report pages has two blocks.
+   * Each block keeps its own rows and printed subtotal, so the check is done
+   * block by block.
    */
-  const subtotais = new Map<ClientData, number[]>();
+  const blocos = new Map<
+    ClientData,
+    { valores: number[]; subtotal: number | null; linha: number }[]
+  >();
   /** Refreshed every time a product header row shows up in the tab. */
   let colunas: ColumnMap = aba.colunas;
   let produtosLidos = 0;
+  /** Inside the "Totais por unidade" block that closes the report */
+  let emTotais = false;
+  const totaisImpressos: { valor: number; linha: number }[] = [];
+  const totalGeralImpresso: { valor: number; linha: number }[] = [];
+  const linhasDescartadas: LeituraAba["linhasDescartadas"] = [];
 
   // Track client entries for duplicate detection
   const clientEntries: { key: string; label: string; row: number }[] = [];
+
+  const descartar = (excelRow: number, motivo: string, valor: number) => {
+    linhasDescartadas.push({ linha: excelRow, motivo, valor });
+    validator.checkCrossField(
+      false,
+      excelRow,
+      colunas.vendaBruta,
+      "linha",
+      "Linha com valor reconhecida como venda, subtotal ou total",
+      `Linha ${excelRow} da aba ${nome}: ${motivo} — valor ${valor} fora do faturamento.`,
+    );
+  };
 
   for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
     const row = rows[rowIdx];
@@ -465,17 +576,27 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
     const cabecalho = lerCabecalhoProdutos(row);
     if (cabecalho) {
       colunas = cabecalho;
+      emTotais = false;
       continue;
     }
 
     // ---- Client header (any column, any casing, any dash) --------------------
     const cliente = lerCabecalhoCliente(row);
     if (cliente) {
+      emTotais = false;
       const { codigo: codigoCliente, nome: nomeCliente, coluna } = cliente;
       const chave = chaveDoCliente(codigoCliente, nomeCliente);
 
-      // Layer 1: Existence — client code and name must exist
-      validator.checkExistence(codigoCliente, excelRow, coluna, "codigoCliente");
+      // Layer 1: Existence — the name must exist. A client printed without a
+      // code is still a valid identification (by name), so it is only a warning.
+      validator.checkCrossField(
+        codigoCliente !== "",
+        excelRow,
+        coluna,
+        "codigoCliente",
+        "Cliente identificado por código",
+        `Cliente "${nomeCliente}" sem código — identificado pelo nome em todos os meses.`,
+      );
       validator.checkExistence(nomeCliente, excelRow, coluna, "nomeCliente");
 
       // Layer 3: Integrity — client name should not be too short
@@ -492,12 +613,13 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
       const existente = clientes.get(chave);
       if (existente) {
         currentClient = existente;
-        subtotais.get(existente)!.push(0);
+        blocos.get(existente)!.push({ valores: [], subtotal: null, linha: excelRow });
         // A later block may carry fields the first one did not print.
         existente.campos = { ...cliente.campos, ...existente.campos };
         existente.dataUltimaCompra ??= cliente.dataUltimaCompra;
         existente.fone ??= cliente.fone;
         existente.celular ??= cliente.celular;
+        existente.funcionario ||= cliente.funcionario;
       } else {
         currentClient = {
           chave,
@@ -512,218 +634,296 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
           totalRecalculado: 0,
           totalConsistente: true,
           origemLinha: excelRow,
+          funcionario: cliente.funcionario,
+          subtotalImpresso: null,
         };
         clientes.set(chave, currentClient);
-        subtotais.set(currentClient, [0]);
+        blocos.set(currentClient, [{ valores: [], subtotal: null, linha: excelRow }]);
       }
       continue;
     }
 
-    const codigo = String(celula(row, colunas.codigo) ?? "").trim();
-    const descricao = String(celula(row, colunas.descricao) ?? "").trim();
-    const temNumero =
-      ehNumero(celula(row, colunas.quantidade)) ||
-      ehNumero(celula(row, colunas.vendaBruta)) ||
-      ehNumero(celula(row, colunas.precoMedio));
+    const codigo = texto(row, colunas.codigo);
+    const descricao = texto(row, colunas.descricao);
+    const qtdLida = lerNumero(celula(row, colunas.quantidade));
+    const vendaLida = lerNumero(celula(row, colunas.vendaBruta));
+    const temValor = qtdLida !== null || vendaLida !== null;
 
-    // A product row carries a code and a description under the current client.
+    // A sale row: under a client, with a product code and/or description that is
+    // not a totals label, and a quantity or a value. Checked before the summary
+    // rows so a product named "TOTAL FLEX 5L" (with its code) is still a sale.
+    const codigoValido = codigo !== "" && !ehRotulo(codigo);
+    const descricaoValida =
+      descricao !== "" && !ehNumero(descricao) && (codigoValido || !ehRotulo(descricao));
     const ehProduto =
-      !!currentClient && !!codigo && RE_CODIGO_PRODUTO.test(codigo) && descricao !== "";
+      !!currentClient && !emTotais && temValor && (codigoValido || descricaoValida);
 
     // ---- Summary / footer rows ----------------------------------------------
-    // Checked after the product test so a product named "TOTAL FLEX 5L" is not
-    // mistaken for a totals line.
     if (!ehProduto) {
       const marcador = primeiroTexto(row);
+
       if (RE_FIM_DE_BLOCO.test(marcador)) {
-        // The totals block ends the client: its rows are not products.
+        if (RE_TOTAL_DA_ABA.test(marcador) || (!currentClient && /^total\b/.test(marcador))) {
+          // "Total geral: 12.345,00" — the tab's own total
+          if (vendaLida !== null) totalGeralImpresso.push({ valor: vendaLida, linha: excelRow });
+        } else if (RE_TOTAIS.test(marcador)) {
+          // "Totais por unidade:" — the per-unit rows that follow add up to the tab
+          emTotais = true;
+          if (vendaLida !== null) totaisImpressos.push({ valor: vendaLida, linha: excelRow });
+        } else if (currentClient && vendaLida !== null) {
+          // "Total do cliente: 1.234,56" — the subtotal of the client's block
+          const bloco = blocos.get(currentClient)!;
+          bloco[bloco.length - 1].subtotal = vendaLida;
+          validator.traceValue(vendaLida, excelRow, colunas.vendaBruta);
+        }
+        // The totals end the client: what follows is not that client's products.
         currentClient = null;
         continue;
       }
-      if (RE_LINHA_IGNORADA.test(marcador)) continue;
-    }
 
-    // A coded line with values but no description cannot join the product
-    // comparison — flag it instead of letting it in as a nameless product.
-    if (currentClient && !ehProduto && codigo && RE_CODIGO_PRODUTO.test(codigo) && temNumero) {
-      validator.checkCrossField(
-        false,
-        excelRow,
-        colunas.descricao,
-        "descricao",
-        "Linha com código e valores precisa de descrição do produto",
-        `Linha ${excelRow} da aba ${nome}: código ${codigo} com valores mas sem descrição — ` +
-          `linha ignorada no comparativo de produtos.`,
-      );
-      continue;
-    }
-
-    // ---- Product row ---------------------------------------------------------
-    if (ehProduto && currentClient) {
-      // Layer 4: Structure — the row must reach the columns the layout declares
-      const colunasNecessarias =
-        Math.max(
-          colunas.codigo,
-          colunas.descricao,
-          colunas.quantidade,
-          colunas.vendaBruta,
-          colunas.precoMedio,
-          colunas.unidade,
-        ) + 1;
-      if (!validator.checkStructure(row, excelRow, colunasNecessarias, `Produto ${codigo}`)) {
+      if (RE_LINHA_IGNORADA.test(marcador)) {
+        // Page furniture, skipped without closing the block (paginated exports).
         continue;
       }
 
-      // Layer 5: Traceability — trace every value to its cell
-      const tCodigo = validator.traceValue(codigo, excelRow, colunas.codigo);
-      const tDescricao = validator.traceValue(descricao, excelRow, colunas.descricao);
-      const tUnidade = validator.traceValue(
-        String(celula(row, colunas.unidade) ?? ""),
-        excelRow,
-        colunas.unidade === COLUNA_AUSENTE ? colunas.descricao : colunas.unidade,
-      );
-
-      // Layer 1: Existence — mandatory fields
-      validator.checkExistence(celula(row, colunas.descricao), excelRow, colunas.descricao, "descricao");
-      validator.checkExistence(celula(row, colunas.quantidade), excelRow, colunas.quantidade, "quantidade");
-      validator.checkExistence(celula(row, colunas.vendaBruta), excelRow, colunas.vendaBruta, "vendaBruta");
-      if (colunas.precoMedio !== COLUNA_AUSENTE) {
-        validator.checkExistence(celula(row, colunas.precoMedio), excelRow, colunas.precoMedio, "precoMedio");
+      if (emTotais) {
+        // "UN | | | 120 | | 4.500,00" — one unit's total
+        if (vendaLida !== null) totaisImpressos.push({ valor: vendaLida, linha: excelRow });
+        continue;
       }
 
-      // Layer 2: Type — numeric fields must be numbers
-      validator.checkType(celula(row, colunas.quantidade), "number", excelRow, colunas.quantidade, "quantidade");
-      validator.checkType(celula(row, colunas.vendaBruta), "number", excelRow, colunas.vendaBruta, "vendaBruta");
-      validator.checkType(celula(row, colunas.descricao), "string", excelRow, colunas.descricao, "descricao");
-      if (colunas.precoMedio !== COLUNA_AUSENTE) {
-        validator.checkType(celula(row, colunas.precoMedio), "number", excelRow, colunas.precoMedio, "precoMedio");
+      // ---- Subtotal row: values with no code and no description -------------
+      if (currentClient && codigo === "" && descricao === "" && vendaLida !== null) {
+        const bloco = blocos.get(currentClient)!;
+        bloco[bloco.length - 1].subtotal = vendaLida;
+        // Layer 5: trace the subtotal
+        validator.traceValue(vendaLida, excelRow, colunas.vendaBruta);
+        continue;
       }
 
-      const quantidade = paraNumero(celula(row, colunas.quantidade));
-      const vendaBruta = paraNumero(celula(row, colunas.vendaBruta));
-      // Without a unit-price column the average price is derived, never invented.
-      const precoMedio =
-        colunas.precoMedio !== COLUNA_AUSENTE
-          ? paraNumero(celula(row, colunas.precoMedio))
-          : quantidade > 0
-            ? preciseRound(vendaBruta / quantidade, 4)
-            : 0;
+      // A value that is neither a sale, a subtotal nor a total: never dropped
+      // quietly — it goes to the conferência as a discarded value.
+      if (vendaLida !== null && vendaLida !== 0) {
+        descartar(
+          excelRow,
+          currentClient
+            ? "linha com valor que não é produto nem subtotal"
+            : "linha com valor fora de qualquer bloco de cliente",
+          vendaLida,
+        );
+      }
+      continue;
+    }
 
-      // Traceability for numeric values
-      const tQuantidade = validator.traceValue(quantidade, excelRow, colunas.quantidade);
-      const tPrecoMedio = validator.traceValue(
-        precoMedio,
-        excelRow,
-        colunas.precoMedio === COLUNA_AUSENTE ? colunas.vendaBruta : colunas.precoMedio,
-      );
-      const tVendaBruta = validator.traceValue(vendaBruta, excelRow, colunas.vendaBruta);
+    // ---- Sale row -------------------------------------------------------------
+    const client = currentClient!;
 
-      // Layer 3: Integrity — numeric ranges
-      validator.checkNumericIntegrity(quantidade, excelRow, colunas.quantidade, "quantidade");
-      validator.checkNumericIntegrity(precoMedio, excelRow, tPrecoMedio.origin.col, "precoMedio");
-      validator.checkNumericIntegrity(vendaBruta, excelRow, colunas.vendaBruta, "vendaBruta");
-
-      // Cross-field: if qty > 0 then price should > 0 and vice versa
+    // A sale row missing its code or its description still is a sale: it counts
+    // in the revenue and is flagged so the source can be fixed.
+    if (!codigoValido || !descricaoValida) {
       validator.checkCrossField(
-        !(quantidade > 0 && precoMedio === 0),
+        false,
         excelRow,
-        tPrecoMedio.origin.col,
-        "precoMedio",
-        "Se quantidade > 0, preco medio deve ser > 0",
-        `Produto ${codigo}: Quantidade ${quantidade} com preco medio zero — possivel dado faltante.`,
+        codigoValido ? colunas.descricao : colunas.codigo,
+        codigoValido ? "descricao" : "codigo",
+        "Linha de venda com código e descrição do produto",
+        `Linha ${excelRow} da aba ${nome}: venda ${codigoValido ? `do código ${codigo} sem descrição` : `de "${descricao}" sem código`} — ` +
+          `contada no faturamento; confira a linha na planilha.`,
       );
-
-      // Math consistency: qty × price = total (with precision)
-      const mathCheck = validator.checkMathConsistency(
-        quantidade,
-        precoMedio,
-        vendaBruta,
-        excelRow,
-        `${currentClient.nome} → Produto ${codigo}`,
-        MATH_TOLERANCE,
-      );
-
-      currentClient.produtos.push({
-        produto: tDescricao.value,
-        codigo: tCodigo.value,
-        unidade: tUnidade.value,
-        valorUnitario: precoMedio,
-        quantidade,
-        valorTotal: vendaBruta,
-        validado: mathCheck.valid,
-        valorCalculado: mathCheck.calculated,
-        divergencia: mathCheck.difference,
-        origens: {
-          codigo: tCodigo.origin,
-          produto: tDescricao.origin,
-          unidade: tUnidade.origin,
-          quantidade: tQuantidade.origin,
-          valorUnitario: tPrecoMedio.origin,
-          valorTotal: tVendaBruta.origin,
-        },
-      });
-      produtosLidos++;
-      continue;
     }
+    const codigoProduto = codigoValido ? codigo : "";
+    const descricaoProduto = descricaoValida ? descricao : `(sem descrição) ${codigo}`;
 
-    // ---- Subtotal row --------------------------------------------------------
+    // Layer 4: Structure — the row must reach the value column
     if (
-      !codigo &&
-      currentClient &&
-      ehNumero(celula(row, colunas.quantidade)) &&
-      ehNumero(celula(row, colunas.vendaBruta))
+      !validator.checkStructure(
+        row,
+        excelRow,
+        Math.max(colunas.quantidade, colunas.vendaBruta) + 1,
+        `Produto ${codigoProduto || descricaoProduto}`,
+      )
     ) {
-      const subtotal = paraNumero(celula(row, colunas.vendaBruta));
-      const blocos = subtotais.get(currentClient)!;
-      blocos[blocos.length - 1] = subtotal;
-
-      // Layer 5: trace the subtotal
-      validator.traceValue(subtotal, excelRow, colunas.vendaBruta);
       continue;
     }
+
+    // Layer 5: Traceability — trace every value to its cell
+    const tCodigo = validator.traceValue(codigoProduto, excelRow, colunas.codigo);
+    const tDescricao = validator.traceValue(descricaoProduto, excelRow, colunas.descricao);
+    const tUnidade = validator.traceValue(
+      texto(row, colunas.unidade),
+      excelRow,
+      colunas.unidade === COLUNA_AUSENTE ? colunas.descricao : colunas.unidade,
+    );
+
+    // Layer 1: Existence — mandatory fields
+    validator.checkExistence(celula(row, colunas.quantidade), excelRow, colunas.quantidade, "quantidade");
+    validator.checkExistence(celula(row, colunas.vendaBruta), excelRow, colunas.vendaBruta, "vendaBruta");
+    if (colunas.precoMedio !== COLUNA_AUSENTE) {
+      validator.checkExistence(celula(row, colunas.precoMedio), excelRow, colunas.precoMedio, "precoMedio");
+    }
+
+    // Layer 2: Type — numeric fields must be numbers (Brazilian format included)
+    validator.checkType(celula(row, colunas.quantidade), "number", excelRow, colunas.quantidade, "quantidade");
+    validator.checkType(celula(row, colunas.vendaBruta), "number", excelRow, colunas.vendaBruta, "vendaBruta");
+    validator.checkType(descricaoProduto, "string", excelRow, colunas.descricao, "descricao");
+    if (colunas.precoMedio !== COLUNA_AUSENTE) {
+      validator.checkType(celula(row, colunas.precoMedio), "number", excelRow, colunas.precoMedio, "precoMedio");
+    }
+
+    const quantidade = qtdLida ?? 0;
+    const vendaBruta = vendaLida ?? 0;
+    // Without a unit-price column the average price is derived, never invented.
+    const precoMedio =
+      colunas.precoMedio !== COLUNA_AUSENTE
+        ? paraNumero(celula(row, colunas.precoMedio))
+        : quantidade !== 0
+          ? preciseRound(vendaBruta / quantidade, 4)
+          : 0;
+
+    // Traceability for numeric values
+    const tQuantidade = validator.traceValue(quantidade, excelRow, colunas.quantidade);
+    const tPrecoMedio = validator.traceValue(
+      precoMedio,
+      excelRow,
+      colunas.precoMedio === COLUNA_AUSENTE ? colunas.vendaBruta : colunas.precoMedio,
+    );
+    const tVendaBruta = validator.traceValue(vendaBruta, excelRow, colunas.vendaBruta);
+
+    // Layer 3: Integrity — numeric ranges
+    validator.checkNumericIntegrity(quantidade, excelRow, colunas.quantidade, "quantidade");
+    validator.checkNumericIntegrity(precoMedio, excelRow, tPrecoMedio.origin.col, "precoMedio");
+    validator.checkNumericIntegrity(vendaBruta, excelRow, colunas.vendaBruta, "vendaBruta");
+
+    // Cross-field: if qty > 0 then price should > 0 and vice versa
+    validator.checkCrossField(
+      !(quantidade > 0 && precoMedio === 0),
+      excelRow,
+      tPrecoMedio.origin.col,
+      "precoMedio",
+      "Se quantidade > 0, preco medio deve ser > 0",
+      `Produto ${codigoProduto || descricaoProduto}: Quantidade ${quantidade} com preco medio zero — possivel dado faltante.`,
+    );
+
+    // Math consistency: qty × price = total, within the rounding of the
+    // printed average price.
+    const mathCheck = validator.checkMathConsistency(
+      quantidade,
+      precoMedio,
+      vendaBruta,
+      excelRow,
+      `${client.nome} → Produto ${codigoProduto || descricaoProduto}`,
+      MATH_TOLERANCE + Math.abs(quantidade) * ARREDONDAMENTO_PRECO_POR_UNIDADE,
+      colunas.vendaBruta,
+    );
+
+    client.produtos.push({
+      produto: tDescricao.value,
+      codigo: tCodigo.value,
+      unidade: tUnidade.value,
+      valorUnitario: precoMedio,
+      quantidade,
+      valorTotal: vendaBruta,
+      validado: mathCheck.valid,
+      valorCalculado: mathCheck.calculated,
+      divergencia: mathCheck.difference,
+      origens: {
+        codigo: tCodigo.origin,
+        produto: tDescricao.origin,
+        unidade: tUnidade.origin,
+        quantidade: tQuantidade.origin,
+        valorUnitario: tPrecoMedio.origin,
+        valorTotal: tVendaBruta.origin,
+      },
+    });
+    const bloco = blocos.get(client)!;
+    bloco[bloco.length - 1].valores.push(vendaBruta);
+    produtosLidos++;
   }
 
   // ---- Duplicate detection for clients ---------------------------------------
   validator.checkDuplicates(clientEntries, `Periodo ${nome}`);
 
-  // ---- Aggregation integrity per client --------------------------------------
-  let totalFaturamento = 0;
+  // ---- Revenue per client: the sum of its sale rows ----------------------------
+  let subtotaisImpressos: number | null = null;
+  let faturamentoBlocosComSubtotal = 0;
   for (const c of clientes.values()) {
     const productValues = c.produtos.map((p) => p.valorTotal);
-    const sumProdutos = preciseSum(productValues);
+    const sumProdutos = somarValores(productValues);
     c.totalRecalculado = sumProdutos;
-    c.totalGeral = preciseSum(subtotais.get(c) ?? []);
+    c.totalGeral = sumProdutos;
 
-    if (c.totalGeral === 0) {
-      c.totalGeral = sumProdutos;
-    } else {
-      c.totalConsistente = validator.checkAggregation(
-        productValues,
-        c.totalGeral,
-        c.origemLinha,
+    // Printed subtotals check the rows, block by block.
+    const impressos: number[] = [];
+    for (const b of blocos.get(c) ?? []) {
+      if (b.subtotal === null) continue;
+      impressos.push(b.subtotal);
+      faturamentoBlocosComSubtotal += somarValores(b.valores);
+      const ok = validator.checkAggregation(
+        b.valores,
+        b.subtotal,
+        b.linha,
         `${nome} → ${c.nome}`,
         AGGREGATION_TOLERANCE,
+        colunas.vendaBruta,
       );
+      if (!ok) c.totalConsistente = false;
+    }
+    if (impressos.length) {
+      c.subtotalImpresso = somarValores(impressos);
+      subtotaisImpressos = somarValores([subtotaisImpressos ?? 0, c.subtotalImpresso]);
     }
 
     // Duplicate product detection within same client
     const prodEntries = c.produtos.map((p) => ({
-      key: p.codigo,
+      key: chaveDoProduto(p.codigo, p.produto),
       label: `${p.produto} (${p.codigo})`,
       row: p.origens.codigo.row,
     }));
     validator.checkDuplicates(prodEntries, `${nome} → ${c.nome}`);
-
-    totalFaturamento += c.totalGeral;
   }
 
-  totalFaturamento = preciseRound(totalFaturamento, 4);
+  const todos = [...clientes.values()];
+  const clientesCarteira = new Map(todos.filter((c) => !c.funcionario).map((c) => [c.chave, c]));
+  const funcionarios = new Map(todos.filter((c) => c.funcionario).map((c) => [c.chave, c]));
+
+  const totalFaturamento = somarValores(todos.map((c) => c.totalGeral));
+  const faturamentoCarteira = somarValores([...clientesCarteira.values()].map((c) => c.totalGeral));
+  const faturamentoFuncionarios = somarValores([...funcionarios.values()].map((c) => c.totalGeral));
+
+  const vendas = todos.flatMap((c) => c.produtos);
+  const totalImpresso = totalGeralImpresso.length
+    ? {
+        valor: somarValores(totalGeralImpresso.map((t) => t.valor)),
+        origem: "Total geral",
+        linha: totalGeralImpresso[0].linha,
+      }
+    : totaisImpressos.length
+      ? {
+          valor: somarValores(totaisImpressos.map((t) => t.valor)),
+          origem: "Totais por unidade",
+          linha: totaisImpressos[0].linha,
+        }
+      : null;
 
   return {
     nome,
     sheetName: aba.sheetName,
     clientes,
+    clientesCarteira,
+    funcionarios,
     totalFaturamento,
+    faturamentoCarteira,
+    faturamentoFuncionarios,
+    leituraAba: {
+      registrosVenda: produtosLidos,
+      quantidadeTotal: somarValores(vendas.map((p) => p.quantidade)),
+      produtosDistintos: new Set(vendas.map((p) => chaveDoProduto(p.codigo, p.produto))).size,
+      faturamentoRegistros: somarValores(vendas.map((p) => p.valorTotal)),
+      subtotaisImpressos,
+      faturamentoBlocosComSubtotal: preciseRound(faturamentoBlocosComSubtotal, 4),
+      totalImpresso,
+      linhasDescartadas,
+    },
     validationReport: validator.getReport(),
     origemPeriodo: aba.origemPeriodo,
     mes: aba.mes,
@@ -784,7 +984,8 @@ function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
   const allClients = new Map<string, { indicesPresente: number[] }>();
 
   for (let i = 0; i < n; i++) {
-    for (const chave of periodos[i].clientes.keys()) {
+    // Employees ("*") are buyers, not portfolio clients.
+    for (const chave of periodos[i].clientesCarteira.keys()) {
       if (!allClients.has(chave)) allClients.set(chave, { indicesPresente: [] });
       allClients.get(chave)!.indicesPresente.push(i);
     }
@@ -811,7 +1012,7 @@ function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
     // series instead of as a single snapshot.
     const faturamentoPorPeriodo: Record<string, number> = {};
     for (const p of periodos) {
-      faturamentoPorPeriodo[p.nome] = p.clientes.get(chave)?.totalGeral ?? 0;
+      faturamentoPorPeriodo[p.nome] = p.clientesCarteira.get(chave)?.totalGeral ?? 0;
     }
 
     // Measured between the client's own first and last purchase: a client that
@@ -819,11 +1020,11 @@ function classificarCarteira(periodos: PeriodData[]): ClienteCarteira[] {
     const firstIdx = Math.min(...data.indicesPresente);
     const serie = periodos
       .slice(firstIdx, lastIdx + 1)
-      .map((p) => p.clientes.get(chave)?.totalGeral ?? 0);
+      .map((p) => p.clientesCarteira.get(chave)?.totalGeral ?? 0);
     const { tendencia, variacao: variacaoPeriodo } = tendenciaDaSerie(serie);
 
     // Name and contact details as printed in the last month the client bought.
-    const ultimo = periodos[lastIdx].clientes.get(chave)!;
+    const ultimo = periodos[lastIdx].clientesCarteira.get(chave)!;
 
     result.push({
       chave,
@@ -852,9 +1053,13 @@ function variacao(de: number, para: number): number | null {
   return preciseRound(((para - de) / de) * 100, 4);
 }
 
+/**
+ * Revenue per portfolio client. Employees are neither in the count nor in the
+ * revenue it divides, so their purchases do not inflate the client ticket.
+ */
 function ticketMedio(periodo: PeriodData): number {
-  const n = periodo.clientes.size;
-  return n > 0 ? preciseRound(periodo.totalFaturamento / n, 4) : 0;
+  const n = periodo.clientesCarteira.size;
+  return n > 0 ? preciseRound(periodo.faturamentoCarteira / n, 4) : 0;
 }
 
 /** Turns a client of one month into a movement entry, keeping every field. */
@@ -897,7 +1102,7 @@ function compararPeriodos(periodos: PeriodData[]): TransicaoPeriodo[] {
     // Everyone seen before the previous month — tells novo from retornado.
     const vistoAntesDeDe = new Set<string>();
     for (let j = 0; j < i - 1; j++) {
-      for (const chave of periodos[j].clientes.keys()) vistoAntesDeDe.add(chave);
+      for (const chave of periodos[j].clientesCarteira.keys()) vistoAntesDeDe.add(chave);
     }
 
     const novos: ClienteMovimento[] = [];
@@ -908,8 +1113,10 @@ function compararPeriodos(periodos: PeriodData[]): TransicaoPeriodo[] {
     let expansao = 0;
     let contracao = 0;
 
-    for (const [chave, cliente] of para.clientes) {
-      const anterior = de.clientes.get(chave);
+    // Client movement is read on portfolio clients only: an employee never
+    // enters as "novo" nor leaves as "perdido".
+    for (const [chave, cliente] of para.clientesCarteira) {
+      const anterior = de.clientesCarteira.get(chave);
       if (anterior) {
         mantidos.push(movimento(cliente));
         const delta = cliente.totalGeral - anterior.totalGeral;
@@ -923,8 +1130,8 @@ function compararPeriodos(periodos: PeriodData[]): TransicaoPeriodo[] {
     }
 
     // Measured in the month they last bought — the month they are leaving.
-    for (const [chave, cliente] of de.clientes) {
-      if (!para.clientes.has(chave)) perdidos.push(movimento(cliente));
+    for (const [chave, cliente] of de.clientesCarteira) {
+      if (!para.clientesCarteira.has(chave)) perdidos.push(movimento(cliente));
     }
 
     const gNovos = grupo(novos);
@@ -943,9 +1150,9 @@ function compararPeriodos(periodos: PeriodData[]): TransicaoPeriodo[] {
       faturamentoPara: para.totalFaturamento,
       variacaoFaturamento: variacao(de.totalFaturamento, para.totalFaturamento),
       diferencaFaturamento: diferenca,
-      clientesDe: de.clientes.size,
-      clientesPara: para.clientes.size,
-      variacaoClientes: variacao(de.clientes.size, para.clientes.size),
+      clientesDe: de.clientesCarteira.size,
+      clientesPara: para.clientesCarteira.size,
+      variacaoClientes: variacao(de.clientesCarteira.size, para.clientesCarteira.size),
       ticketMedioDe: tmDe,
       ticketMedioPara: tmPara,
       variacaoTicketMedio: variacao(tmDe, tmPara),
@@ -959,11 +1166,12 @@ function compararPeriodos(periodos: PeriodData[]): TransicaoPeriodo[] {
         expansao: preciseRound(expansao, 4),
         contracao: preciseRound(contracao, 4),
         perdidos: preciseRound(-gPerdidos.faturamento, 4),
+        funcionarios: preciseRound(para.faturamentoFuncionarios - de.faturamentoFuncionarios, 4),
         total: diferenca,
       },
       taxaRetencao:
-        de.clientes.size > 0
-          ? preciseRound((mantidos.length / de.clientes.size) * 100, 4)
+        de.clientesCarteira.size > 0
+          ? preciseRound((mantidos.length / de.clientesCarteira.size) * 100, 4)
           : null,
     });
   }
@@ -981,7 +1189,7 @@ function consolidarEvolucao(
   const ultimo = periodos[periodos.length - 1];
 
   const faturamentos = periodos.map((p) => p.totalFaturamento);
-  const faturamentoTotal = preciseSum(faturamentos);
+  const faturamentoTotal = somarValores(faturamentos);
 
   const melhor = periodos.reduce((a, b) => (b.totalFaturamento > a.totalFaturamento ? b : a));
   const pior = periodos.reduce((a, b) => (b.totalFaturamento < a.totalFaturamento ? b : a));
@@ -1017,9 +1225,9 @@ function consolidarEvolucao(
     variacaoMediaMensal: variacoes.length
       ? preciseRound(variacoes.reduce((a, b) => a + b, 0) / variacoes.length, 4)
       : null,
-    clientesInicial: primeiro.clientes.size,
-    clientesFinal: ultimo.clientes.size,
-    variacaoClientes: variacao(primeiro.clientes.size, ultimo.clientes.size),
+    clientesInicial: primeiro.clientesCarteira.size,
+    clientesFinal: ultimo.clientesCarteira.size,
+    variacaoClientes: variacao(primeiro.clientesCarteira.size, ultimo.clientesCarteira.size),
     ticketMedioInicial: tmInicial,
     ticketMedioFinal: tmFinal,
     variacaoTicketMedio: variacao(tmInicial, tmFinal),
@@ -1058,7 +1266,7 @@ function resumirEvolucao(
     return {
       nome: p.nome,
       faturamento: p.totalFaturamento,
-      clientes: p.clientes.size,
+      clientes: p.clientesCarteira.size,
       ticketMedio: ticketMedio(p),
       variacaoFaturamento: t ? t.variacaoFaturamento : null,
       variacaoClientes: t ? t.variacaoClientes : null,
@@ -1071,6 +1279,8 @@ function resumirEvolucao(
       faturamentoNovos: t ? t.novos.faturamento : null,
       faturamentoPerdidos: t ? t.perdidos.faturamento : null,
       taxaRetencao: t ? t.taxaRetencao : null,
+      funcionarios: p.funcionarios.size,
+      faturamentoFuncionarios: p.faturamentoFuncionarios,
     };
   });
 }
@@ -1079,18 +1289,23 @@ interface ProdutoAgregado {
   qtd: number;
   valor: number;
   codigo: string;
+  produto: string;
 }
 
-/** Revenue/quantity per product, for one period. */
+/**
+ * Revenue/quantity per product, for one period. Every buyer counts here —
+ * employees included: their purchases are product sales like any other.
+ */
 function agregarProdutos(periodo: PeriodData): Map<string, ProdutoAgregado> {
   const m = new Map<string, ProdutoAgregado>();
   for (const c of periodo.clientes.values()) {
     for (const p of c.produtos) {
-      const e = m.get(p.produto) ?? { qtd: 0, valor: 0, codigo: p.codigo };
-      e.qtd = preciseRound(e.qtd + p.quantidade, 4);
-      e.valor = preciseRound(e.valor + p.valorTotal, 4);
+      const chave = chaveDoProduto(p.codigo, p.produto);
+      const e = m.get(chave) ?? { qtd: 0, valor: 0, codigo: p.codigo, produto: p.produto };
+      e.qtd = somarValores([e.qtd, p.quantidade]);
+      e.valor = somarValores([e.valor, p.valorTotal]);
       if (!e.codigo) e.codigo = p.codigo;
-      m.set(p.produto, e);
+      m.set(chave, e);
     }
   }
   return m;
@@ -1105,17 +1320,17 @@ function resumirCarteira(
   const anteriores = periodos.slice(0, -1);
 
   const vistoAntes = new Set<string>();
-  for (const p of anteriores) for (const nome of p.clientes.keys()) vistoAntes.add(nome);
+  for (const p of anteriores) for (const nome of p.clientesCarteira.keys()) vistoAntes.add(nome);
 
   const ativos: ClientData[] = [];
   const novos: ClientData[] = [];
   const retornados: ClientData[] = [];
 
-  for (const [nome, cliente] of atual.clientes) {
+  for (const [nome, cliente] of atual.clientesCarteira) {
     ativos.push(cliente);
     if (!vistoAntes.has(nome)) {
       novos.push(cliente);
-    } else if (!anterior.clientes.has(nome)) {
+    } else if (!anterior.clientesCarteira.has(nome)) {
       // Skipped last month but bought before — a longer buying cycle, not a new client.
       retornados.push(cliente);
     }
@@ -1182,8 +1397,9 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   const periodoAtual = periodos[periodos.length - 1];
 
   // ---- Client comparison -----------------------------------------------------
-  const nomesAnterior = new Set(periodoAnterior.clientes.keys());
-  const nomesAtual = new Set(periodoAtual.clientes.keys());
+  // Portfolio clients only — employees are not new or lost clients.
+  const nomesAnterior = new Set(periodoAnterior.clientesCarteira.keys());
+  const nomesAtual = new Set(periodoAtual.clientesCarteira.keys());
 
   const clientesNovos: ClientData[] = [];
   const clientesPerdidos: ClientData[] = [];
@@ -1191,14 +1407,14 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
 
   for (const nome of nomesAtual) {
     if (!nomesAnterior.has(nome)) {
-      clientesNovos.push(periodoAtual.clientes.get(nome)!);
+      clientesNovos.push(periodoAtual.clientesCarteira.get(nome)!);
     } else {
       clientesMantidos.push(nome);
     }
   }
   for (const nome of nomesAnterior) {
     if (!nomesAtual.has(nome)) {
-      clientesPerdidos.push(periodoAnterior.clientes.get(nome)!);
+      clientesPerdidos.push(periodoAnterior.clientesCarteira.get(nome)!);
     }
   }
 
@@ -1226,7 +1442,7 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   // Aggregated once per period, so every month of the file feeds the product
   // analysis instead of only the two compared months.
   const produtosPorPeriodo = periodos.map(agregarProdutos);
-  const vazio: ProdutoAgregado = { qtd: 0, valor: 0, codigo: "" };
+  const vazio: ProdutoAgregado = { qtd: 0, valor: 0, codigo: "", produto: "" };
 
   const produtosAnterior = produtosPorPeriodo[produtosPorPeriodo.length - 2];
   const produtosAtual = produtosPorPeriodo[produtosPorPeriodo.length - 1];
@@ -1246,23 +1462,27 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     const valorPorPeriodo: Record<string, number> = {};
     const qtdPorPeriodo: Record<string, number> = {};
     let codigo = atu.codigo || ant.codigo;
+    // Shown with the description of the most recent month it was sold in.
+    let produto = "";
     periodos.forEach((p, i) => {
       const e = produtosPorPeriodo[i].get(prod);
       valorPorPeriodo[p.nome] = e?.valor ?? 0;
       qtdPorPeriodo[p.nome] = e?.qtd ?? 0;
       if (!codigo && e?.codigo) codigo = e.codigo;
+      if (e?.produto) produto = e.produto;
     });
 
     const serie = periodos.map((p) => valorPorPeriodo[p.nome]);
     const { tendencia, variacao: variacaoPeriodo } = tendenciaDaSerie(serie);
 
     comparativoProdutos.push({
-      produto: prod,
+      chave: prod,
+      produto,
       codigo,
-      mesesComVenda: serie.filter((v) => v > 0).length,
+      mesesComVenda: serie.filter((v) => v !== 0).length,
       variacaoPeriodo,
       tendencia,
-      valorTotalPeriodo: preciseSum(serie),
+      valorTotalPeriodo: somarValores(serie),
       qtdAnterior: ant.qtd,
       qtdAtual: atu.qtd,
       variacaoQtd: ant.qtd > 0
@@ -1298,13 +1518,20 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
         }
       }
       if (!c.totalConsistente) {
+        const impresso = c.subtotalImpresso ?? 0;
         inconsistencias.push(
           `${period.nome} → ${c.nome}: ` +
-          `Total reportado (${toDisplay(c.totalGeral).toFixed(2)}) ≠ ` +
-          `Soma dos produtos (${toDisplay(c.totalRecalculado).toFixed(2)}) ` +
-          `[Divergência: R$ ${Math.abs(c.totalGeral - c.totalRecalculado).toFixed(4)}]`
+          `Subtotal impresso (${toDisplay(impresso).toFixed(2)}) ≠ ` +
+          `Soma das vendas (${toDisplay(c.totalRecalculado).toFixed(2)}) ` +
+          `[Divergência: R$ ${Math.abs(impresso - c.totalRecalculado).toFixed(4)}]`
         );
       }
+    }
+    for (const d of period.leituraAba.linhasDescartadas) {
+      inconsistencias.push(
+        `${period.nome} → linha ${d.linha}: ${d.motivo} ` +
+        `[Valor fora do faturamento: R$ ${d.valor.toFixed(2)}] [Origem: ${period.sheetName}]`,
+      );
     }
   }
 
@@ -1316,14 +1543,35 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   const transicoes = compararPeriodos(periodos);
   const evolucaoPeriodos = resumirEvolucao(periodos, transicoes);
   const evolucaoConsolidada = consolidarEvolucao(periodos, transicoes, classificacaoCarteira);
+  const funcionarios = resumirFuncionarios(periodos);
+
+  // ---- Conferência: spreadsheet × processed figures ---------------------------
+  // Re-checks every figure the screens show against what the tabs printed and
+  // against each other. A divergence is an error in the validation report and an
+  // alert — never a number shown as valid.
+  const conferencia = conferirAnalise({
+    periodos,
+    comparativoProdutos,
+    classificacaoCarteira,
+    carteira,
+    transicoes,
+    evolucaoPeriodos,
+    evolucaoConsolidada,
+    funcionarios,
+    periodosRepetidos: descoberta.periodosRepetidos,
+  });
+  for (const item of conferencia.itens) {
+    if (!item.ok) inconsistencias.push(`Conferência · ${item.escopo} → ${item.descricao}: ${item.detalhe}`);
+  }
 
   // ---- Merge validation reports into one combined report ----------------------
   // Covers every period read from the file: a month left out of the validation
   // is a month nobody checked, which is how a whole tab used to go missing
   // without a single alert.
-  const allDiagnostics = periodos.flatMap((p) => p.validationReport.diagnostics);
-  const totalChecks = periodos.reduce((s, p) => s + p.validationReport.totalChecks, 0);
-  const passedChecks = periodos.reduce((s, p) => s + p.validationReport.passedChecks, 0);
+  const relatorios = [...periodos.map((p) => p.validationReport), conferencia.validationReport];
+  const allDiagnostics = relatorios.flatMap((r) => r.diagnostics);
+  const totalChecks = relatorios.reduce((s, r) => s + r.totalChecks, 0);
+  const passedChecks = relatorios.reduce((s, r) => s + r.passedChecks, 0);
 
   // A report tab that produced no client at all is a reading failure, not an
   // empty month: surface it instead of letting the period show up as zero.
@@ -1344,8 +1592,8 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   }
 
   const layerSummary: Record<string, { passed: number; failed: number }> = {};
-  for (const period of periodos) {
-    for (const [layer, counts] of Object.entries(period.validationReport.layerSummary)) {
+  for (const relatorio of relatorios) {
+    for (const [layer, counts] of Object.entries(relatorio.layerSummary)) {
       if (!layerSummary[layer]) layerSummary[layer] = { passed: 0, failed: 0 };
       layerSummary[layer].passed += counts.passed;
       layerSummary[layer].failed += counts.failed;
@@ -1379,6 +1627,33 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
     evolucaoPeriodos,
     transicoes,
     evolucaoConsolidada,
+    funcionarios,
+    conferencia,
     validationReport,
   };
+}
+
+/** Employees found in any month, with their purchases per month. */
+function resumirFuncionarios(periodos: PeriodData[]): FuncionarioResumo[] {
+  const mapa = new Map<string, FuncionarioResumo>();
+  for (const p of periodos) {
+    for (const f of p.funcionarios.values()) {
+      const e =
+        mapa.get(f.chave) ??
+        {
+          chave: f.chave,
+          nome: f.nome,
+          codigoCliente: f.codigoCliente || undefined,
+          faturamentoPorPeriodo: Object.fromEntries(periodos.map((q) => [q.nome, 0])),
+          faturamentoTotal: 0,
+          periodosPresente: [],
+        };
+      e.nome = f.nome;
+      e.faturamentoPorPeriodo[p.nome] = f.totalGeral;
+      e.faturamentoTotal = somarValores([e.faturamentoTotal, f.totalGeral]);
+      e.periodosPresente.push(p.nome);
+      mapa.set(f.chave, e);
+    }
+  }
+  return [...mapa.values()].sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
 }

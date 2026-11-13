@@ -1,0 +1,589 @@
+import { describe, it, expect } from "vitest";
+import * as XLSX from "xlsx";
+import { analyzeWorkbook, type AnalysisResult } from "../lib/excel-analyzer";
+import { lerNumero } from "../lib/numero-br";
+
+/**
+ * Apuração do arquivo de vendas, de ponta a ponta, com SEIS abas mensais.
+ *
+ * O valor esperado de cada mês é calculado aqui, em centavos inteiros, direto
+ * dos registros que vão para a planilha — nunca pelo mesmo código que o sistema
+ * usa. O mesmo conteúdo é gravado em todos os formatos que o ERP produz
+ * (.xlsx numérico, .xlsx com texto em formato brasileiro, .xls binário, .xls em
+ * HTML, .xls em XML 2003) e o sistema precisa chegar exatamente aos mesmos
+ * números em todos eles.
+ */
+
+// ---------------------------------------------------------------------------
+// Base de dados do teste
+// ---------------------------------------------------------------------------
+
+interface Venda {
+  codigo: string;
+  produto: string;
+  un: "UN" | "KG";
+  qtd: number;
+  /** preço médio como impresso (2 casas) */
+  preco: number;
+  /** venda bruta impressa, em centavos */
+  centavos: number;
+}
+
+interface Comprador {
+  codigo: string;
+  nome: string;
+  vendas: Venda[];
+}
+
+const MESES = ["janeiro", "fevereiro", "marco", "abril", "maio", "junho"];
+const ROTULOS = ["janeiro 2026", "fevereiro 2026", "março 2026", "abril 2026", "maio 2026", "junho 2026"];
+
+const v = (codigo: string, produto: string, qtd: number, preco: number, centavos: number, un: "UN" | "KG" = "UN"): Venda => ({
+  codigo,
+  produto,
+  un,
+  qtd,
+  preco,
+  centavos,
+});
+
+/**
+ * ALFA       compra nos 6 meses (valores com milhar e centavos)
+ * BETA       compra em jan–mar e some (perdido)
+ * GAMA       começa em abril (novo)
+ * DELTA      jan, fev, some em mar/abr, volta em mai/jun (retorno)
+ * *MARIA     funcionária: jan–mar e para — nunca "perdida"
+ * *JOÃO      funcionário: só junho — nunca "novo"
+ * *CLIENTE TESTE  funcionário sem código: fev e mai
+ */
+function compradoresDoMes(m: number): Comprador[] {
+  const lista: Comprador[] = [];
+  const fator = m + 1; // valores mudam mês a mês
+
+  lista.push({
+    codigo: "1001",
+    nome: "ALFA COMERCIO LTDA",
+    vendas: [
+      // 1.200 × 3,50 = 4.200,00 — o caso que o leitor antigo transformava em 4,2
+      v("5001", "ARROZ TIPO 1 5KG", 1200, 3.5, 420000),
+      // 7 × 1,43 = 10,01 — preço médio arredondado
+      v("5002", "PARAFUSO 3/8", 7, 1.43, 1001),
+      // 300 × 3,33 = 999,00 impresso como 1.000,00: diferença é só o arredondamento do preço médio
+      v("5003", "OLEO DE SOJA 900ML", 300, 3.33, 100000),
+      v("5010", "CARNE BOVINA", 12.5 * fator, 39.9, Math.round(12.5 * fator * 3990), "KG"),
+    ],
+  });
+  if (m <= 2) {
+    lista.push({
+      codigo: "1002",
+      nome: "BETA MERCEARIA",
+      vendas: [v("5004", "FEIJAO CARIOCA 1KG", 50, 8.79, 43950), v("5001", "ARROZ TIPO 1 5KG", 10, 25.9, 25900)],
+    });
+  }
+  if (m >= 3) {
+    lista.push({
+      codigo: "1003",
+      nome: "GAMA SUPERMERCADOS",
+      vendas: [v("5005", "ACUCAR CRISTAL 5KG", 1000, 12.34, 1234000)],
+    });
+  }
+  if (m <= 1 || m >= 4) {
+    lista.push({
+      codigo: "1004",
+      nome: "DELTA PADARIA",
+      vendas: [v("5006", "FARINHA DE TRIGO 25KG", 3, 89.9, 26970)],
+    });
+  }
+  if (m <= 2) {
+    lista.push({
+      codigo: "2001",
+      nome: "*MARIA SILVA",
+      vendas: [v("5007", "CAFE 500G", 2, 15.5, 3100)],
+    });
+  }
+  if (m === 5) {
+    lista.push({
+      codigo: "2002",
+      nome: "*JOÃO PEREIRA",
+      vendas: [v("5007", "CAFE 500G", 4, 15.5, 6200), v("5008", "LEITE INTEGRAL 1L", 12, 4.99, 5988)],
+    });
+  }
+  if (m === 1 || m === 4) {
+    lista.push({
+      codigo: "",
+      nome: "*CLIENTE TESTE",
+      vendas: [v("5009", "BOLACHA RECHEADA", 1, 3.75, 375)],
+    });
+  }
+  return lista;
+}
+
+const esperadoCentavos = MESES.map((_, m) =>
+  compradoresDoMes(m).reduce((s, c) => s + c.vendas.reduce((a, x) => a + x.centavos, 0), 0),
+);
+const esperadoFuncionariosCentavos = MESES.map((_, m) =>
+  compradoresDoMes(m)
+    .filter((c) => c.nome.startsWith("*"))
+    .reduce((s, c) => s + c.vendas.reduce((a, x) => a + x.centavos, 0), 0),
+);
+const esperadoRegistros = MESES.map((_, m) =>
+  compradoresDoMes(m).reduce((s, c) => s + c.vendas.length, 0),
+);
+const esperadoClientesCarteira = MESES.map(
+  (_, m) => compradoresDoMes(m).filter((c) => !c.nome.startsWith("*")).length,
+);
+
+// ---------------------------------------------------------------------------
+// Formatos de gravação
+// ---------------------------------------------------------------------------
+
+type Celula = string | number | null;
+
+/** 4200 → "4.200,00" (como o ERP imprime em texto) */
+function br(n: number, casas = 2): string {
+  const [int, dec] = Math.abs(n).toFixed(casas).split(".");
+  const comMilhar = int.replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+  return `${n < 0 ? "-" : ""}${comMilhar}${casas ? `,${dec}` : ""}`;
+}
+/** quantidade sem casas desnecessárias: 1200 → "1.200", 12,5 → "12,5" */
+function brQtd(n: number): string {
+  return Number.isInteger(n) ? br(n, 0) : br(n, 1);
+}
+
+type Formato = "numero" | "texto-br" | "moeda-br";
+
+interface OpcoesAba {
+  formato: Formato;
+  /** colunas vazias antes do relatório */
+  recuo?: number;
+  /** rótulo alternativo da coluna de valor */
+  rotuloValor?: string;
+  /** imprime "Data: 01/mm/2026 a ..." em cada cliente (identificação por conteúdo) */
+  intervalo?: boolean;
+  /** sobrescreve o subtotal impresso do primeiro cliente (centavos) */
+  subtotalErrado?: number;
+  /** sobrescreve o total impresso da aba (centavos) */
+  totalErrado?: number;
+  /** linha com valor solta, fora de qualquer cliente */
+  linhaSolta?: boolean;
+}
+
+function linhasDaAba(m: number, o: OpcoesAba): Celula[][] {
+  const pad = (cells: Celula[]) => [...Array<null>(o.recuo ?? 0).fill(null), ...cells];
+  const num = (n: number, casas = 2): Celula =>
+    o.formato === "numero" ? n : o.formato === "moeda-br" && casas === 2 ? `R$ ${br(n, casas)}` : br(n, casas);
+  const qtd = (n: number): Celula => (o.formato === "numero" ? n : brQtd(n));
+
+  const mm = String(m + 1).padStart(2, "0");
+  const rows: Celula[][] = [];
+  rows.push(pad(["Vendas de produto no período"]));
+  rows.push(pad([`Período: 01/${mm}/2026 a 28/${mm}/2026`]));
+  rows.push([]);
+  if (o.linhaSolta) rows.push(pad([null, null, null, null, null, num(123.45)]));
+
+  const porUnidade = new Map<string, { qtd: number; centavos: number }>();
+  compradoresDoMes(m).forEach((c, i) => {
+    const id = c.codigo ? `${c.codigo} - ${c.nome}` : c.nome;
+    const sufixo = o.intervalo ? ` - Data: 01/${mm}/2026 a 28/${mm}/2026` : "";
+    rows.push(pad([`Cliente: ${id}${sufixo} - Data da última compra: 20/${mm}/2026`]));
+    rows.push(pad(["Código", "Descrição", "UN", "Qtd. venda", "Preço médio venda", o.rotuloValor ?? "Venda bruta"]));
+    let soma = 0;
+    let q = 0;
+    for (const x of c.vendas) {
+      rows.push(pad([x.codigo, x.produto, x.un, qtd(x.qtd), num(x.preco), num(x.centavos / 100)]));
+      soma += x.centavos;
+      q += x.qtd;
+      const u = porUnidade.get(x.un) ?? { qtd: 0, centavos: 0 };
+      u.qtd += x.qtd;
+      u.centavos += x.centavos;
+      porUnidade.set(x.un, u);
+    }
+    const subtotal = i === 0 && o.subtotalErrado !== undefined ? o.subtotalErrado : soma;
+    rows.push(pad([null, null, null, qtd(q), null, num(subtotal / 100)]));
+    rows.push([]);
+  });
+
+  rows.push(pad(["Totais por unidade:"]));
+  const unidades = [...porUnidade.entries()];
+  unidades.forEach(([un, t], i) => {
+    const valor = i === 0 && o.totalErrado !== undefined ? o.totalErrado : t.centavos;
+    rows.push(pad([un, null, null, qtd(t.qtd), null, num(valor / 100)]));
+  });
+  rows.push(pad(["Gerado em 05/07/2026 14:32", null, null, null, null, null]));
+  rows.push(pad(["Página 1 de 1"]));
+  return rows;
+}
+
+function paraBuffer(out: unknown): ArrayBuffer {
+  return out instanceof ArrayBuffer ? out : new Uint8Array(out as ArrayLike<number>).buffer;
+}
+
+function pasta(opcoes: (m: number) => OpcoesAba, bookType: XLSX.BookType = "xlsx", nomes = ROTULOS): ArrayBuffer {
+  const wb = XLSX.utils.book_new();
+  MESES.forEach((_, m) => {
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(linhasDaAba(m, opcoes(m))), nomes[m]);
+  });
+  return paraBuffer(XLSX.write(wb, { type: "array", bookType }));
+}
+
+/** ".xls" gravado como HTML — várias tabelas, uma por mês, tudo em texto. */
+function pastaHtml(): ArrayBuffer {
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const tabelas = MESES.map((_, m) => {
+    const linhas = linhasDaAba(m, { formato: "texto-br", intervalo: true });
+    return `<table>${linhas
+      .map((r) => `<tr>${r.map((c) => `<td>${c === null ? "" : esc(String(c))}</td>`).join("")}</tr>`)
+      .join("")}</table>`;
+  });
+  const html = `<html><head><meta charset="utf-8"></head><body>${tabelas.join("")}</body></html>`;
+  return paraBuffer(new TextEncoder().encode(html));
+}
+
+/** ".xls" em XML 2003 (SpreadsheetML), com os números gravados como texto. */
+function pastaXml2003(): ArrayBuffer {
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const abas = MESES.map((_, m) => {
+    const linhas = linhasDaAba(m, { formato: "texto-br" });
+    return `<Worksheet ss:Name="${ROTULOS[m]}"><Table>${linhas
+      .map(
+        (r) =>
+          `<Row>${r
+            .map((c) => (c === null ? "<Cell/>" : `<Cell><Data ss:Type="String">${esc(String(c))}</Data></Cell>`))
+            .join("")}</Row>`,
+      )
+      .join("")}</Table></Worksheet>`;
+  });
+  const xml =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">` +
+    abas.join("") +
+    `</Workbook>`;
+  return paraBuffer(new TextEncoder().encode(xml));
+}
+
+const centavos = (v: number) => Math.round(v * 100);
+
+/** Every check of the conferência, failing ones listed for a readable error. */
+function divergencias(r: AnalysisResult): string[] {
+  return r.conferencia.itens.filter((i) => !i.ok).map((i) => `${i.escopo} · ${i.descricao}: ${i.detalhe}`);
+}
+
+// ---------------------------------------------------------------------------
+// Leitura de números
+// ---------------------------------------------------------------------------
+
+describe("leitura de números no formato brasileiro", () => {
+  it.each([
+    ["4.200,00", 4200],
+    ["1.234.567,89", 1234567.89],
+    ["123,45", 123.45],
+    ["0,5", 0.5],
+    ["R$ 1.234,56", 1234.56],
+    ["R$1.234,56", 1234.56],
+    ["1 234,56", 1234.56],
+    ["1 234,56", 1234.56],
+    ["-1.234,56", -1234.56],
+    ["(1.234,56)", -1234.56],
+    ["1.234,56-", -1234.56],
+    ["1.200", 1200],
+    ["12.345", 12345],
+    ["1.5", 1.5],
+    ["0.500", 0.5],
+    ["1234.56", 1234.56],
+    ["1,234.56", 1234.56],
+    ["10", 10],
+    [" 25 ", 25],
+    [4200.5, 4200.5],
+    [0, 0],
+  ])("%s → %s", (entrada, esperado) => {
+    expect(lerNumero(entrada)).toBeCloseTo(esperado, 10);
+  });
+
+  it.each([["PARAFUSO"], ["01/06/2025"], [""], ["1.23.4"], ["12%"], [null], [undefined], [true], ["UN"]])(
+    "%s não é número",
+    (entrada) => {
+      expect(lerNumero(entrada)).toBeNull();
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Seis abas, todos os formatos
+// ---------------------------------------------------------------------------
+
+const formatos: [string, () => ArrayBuffer][] = [
+  [".xlsx com números", () => pasta(() => ({ formato: "numero" }))],
+  [".xlsx com texto brasileiro", () => pasta(() => ({ formato: "texto-br" }))],
+  [".xlsx com R$ no texto", () => pasta(() => ({ formato: "moeda-br" }))],
+  [".xls binário", () => pasta(() => ({ formato: "numero" }), "biff8")],
+  [".xls binário com texto brasileiro", () => pasta(() => ({ formato: "texto-br" }), "biff8")],
+  [".xls em HTML (abas sem nome de mês)", pastaHtml],
+  [".xls em XML 2003", pastaXml2003],
+  [
+    "abas com formatações diferentes entre si",
+    () =>
+      pasta((m) => ({
+        formato: (["numero", "texto-br", "moeda-br"] as Formato[])[m % 3],
+        recuo: m % 2,
+        rotuloValor: m === 3 ? "Valor total" : undefined,
+      })),
+  ],
+];
+
+describe.each(formatos)("apuração das 6 abas · %s", (_, gerar) => {
+  const r = analyzeWorkbook(gerar());
+
+  it("lê as seis abas, na ordem dos meses", () => {
+    expect(r.periodos).toHaveLength(6);
+    expect(r.periodos.map((p) => p.mes)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(r.leitura.abasIgnoradas).toEqual([]);
+  });
+
+  it("apura o faturamento de cada mês exatamente como a soma dos registros da planilha", () => {
+    expect(r.periodos.map((p) => centavos(p.totalFaturamento))).toEqual(esperadoCentavos);
+    expect(r.evolucaoPeriodos.map((p) => centavos(p.faturamento))).toEqual(esperadoCentavos);
+    expect(centavos(r.evolucaoConsolidada.faturamentoTotal)).toBe(
+      esperadoCentavos.reduce((a, b) => a + b, 0),
+    );
+  });
+
+  it("conta todos os registros de venda, sem duplicar nem omitir", () => {
+    expect(r.periodos.map((p) => p.produtosLidos)).toEqual(esperadoRegistros);
+    expect(r.periodos.map((p) => p.leituraAba.linhasDescartadas)).toEqual(MESES.map(() => []));
+  });
+
+  it("confere com os subtotais e totais impressos em todas as abas", () => {
+    expect(divergencias(r)).toEqual([]);
+    expect(r.conferencia.ok).toBe(true);
+    expect(r.conferencia.abas.every((a) => a.ok)).toBe(true);
+    // the printed totals were really found and compared, not skipped
+    expect(r.conferencia.abas.every((a) => a.totalImpresso !== null && a.subtotaisImpressos !== null)).toBe(true);
+    const erros = r.validationReport.diagnostics.filter((d) => d.severity === "error");
+    expect(erros.map((d) => `${d.cellRef} ${d.field}: ${d.impact}`)).toEqual([]);
+    expect(r.validationReport.valid).toBe(true);
+  });
+
+  it("mantém os funcionários (*) no faturamento", () => {
+    expect(r.periodos.map((p) => centavos(p.faturamentoFuncionarios))).toEqual(esperadoFuncionariosCentavos);
+    expect(r.funcionarios.map((f) => f.nome)).toEqual(["*CLIENTE TESTE", "*JOÃO PEREIRA", "*MARIA SILVA"]);
+    // their products are sales like any other
+    const cafe = r.comparativoProdutos.find((p) => p.produto === "CAFE 500G")!;
+    expect(centavos(cafe.valorPorPeriodo[r.periodos[0].nome])).toBe(3100);
+    expect(centavos(cafe.valorPorPeriodo[r.periodos[5].nome])).toBe(6200);
+    expect(r.comparativoProdutos.some((p) => p.produto === "LEITE INTEGRAL 1L")).toBe(true);
+  });
+
+  it("deixa os funcionários fora de clientes novos, perdidos e carteira", () => {
+    const nomes = (lista: { nome: string }[]) => lista.map((c) => c.nome);
+    const todosOsGrupos = r.transicoes.flatMap((t) => [
+      ...nomes(t.novos.clientes),
+      ...nomes(t.retornados.clientes),
+      ...nomes(t.mantidos.clientes),
+      ...nomes(t.perdidos.clientes),
+    ]);
+    const telas = [
+      ...todosOsGrupos,
+      ...nomes(r.classificacaoCarteira),
+      ...nomes(r.carteira.novos),
+      ...nomes(r.carteira.perdidos),
+      ...nomes(r.carteira.ativos),
+      ...nomes(r.carteira.frequenciaReduzida),
+      ...nomes(r.clientesNovos),
+      ...nomes(r.clientesPerdidos),
+    ];
+    expect(telas.filter((n) => n.startsWith("*"))).toEqual([]);
+
+    expect(r.evolucaoPeriodos.map((p) => p.clientes)).toEqual(esperadoClientesCarteira);
+    expect(r.evolucaoConsolidada.clientesDistintos).toBe(4);
+  });
+
+  it("identifica corretamente novos, perdidos e retornos da carteira", () => {
+    const abril = r.transicoes[2]; // março → abril
+    expect(abril.novos.clientes.map((c) => c.nome)).toEqual(["GAMA SUPERMERCADOS"]);
+    expect(abril.perdidos.clientes.map((c) => c.nome)).toEqual(["BETA MERCEARIA"]);
+    // *MARIA stops buying in abril and is not a lost client
+    expect(abril.perdidos.total).toBe(1);
+
+    const maio = r.transicoes[3];
+    expect(maio.retornados.clientes.map((c) => c.nome)).toEqual(["DELTA PADARIA"]);
+    expect(maio.novos.total).toBe(0);
+
+    const junho = r.transicoes[4];
+    // *JOÃO buys for the first time in junho and is not a new client
+    expect(junho.novos.total).toBe(0);
+
+    expect(r.carteira.perdidos.map((c) => c.nome)).toEqual(["BETA MERCEARIA"]);
+  });
+
+  it("fecha a ponte de receita de cada mês, com a parcela dos funcionários", () => {
+    for (const t of r.transicoes) {
+      const p = t.ponte;
+      const soma = p.novos + p.retornados + p.expansao + p.contracao + p.perdidos + p.funcionarios;
+      expect(centavos(soma)).toBe(centavos(t.diferencaFaturamento));
+    }
+    // março → abril: *MARIA (R$ 31,00) stopped buying
+    expect(centavos(r.transicoes[2].ponte.funcionarios)).toBe(-3100);
+  });
+
+  it("totaliza cada cliente e cada produto pelos valores da planilha", () => {
+    const alfa = r.classificacaoCarteira.find((c) => c.nome === "ALFA COMERCIO LTDA")!;
+    MESES.forEach((_, m) => {
+      const esperado = compradoresDoMes(m)[0].vendas.reduce((s, x) => s + x.centavos, 0);
+      expect(centavos(alfa.faturamentoPorPeriodo[r.periodos[m].nome])).toBe(esperado);
+    });
+
+    const arroz = r.comparativoProdutos.find((p) => p.codigo === "5001")!;
+    MESES.forEach((_, m) => {
+      const esperado = compradoresDoMes(m)
+        .flatMap((c) => c.vendas)
+        .filter((x) => x.codigo === "5001")
+        .reduce((s, x) => s + x.centavos, 0);
+      expect(centavos(arroz.valorPorPeriodo[r.periodos[m].nome])).toBe(esperado);
+    });
+    expect(arroz.qtdPorPeriodo[r.periodos[0].nome]).toBe(1210);
+  });
+
+  it("calcula o ticket médio só com os clientes da carteira", () => {
+    const jan = r.periodos[0];
+    const semFuncionarios = esperadoCentavos[0] - esperadoFuncionariosCentavos[0];
+    expect(centavos(r.evolucaoPeriodos[0].ticketMedio)).toBe(
+      Math.round(semFuncionarios / esperadoClientesCarteira[0]),
+    );
+    expect(jan.clientesCarteira.size).toBe(3);
+    expect(jan.funcionarios.size).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Divergências entre planilha e sistema
+// ---------------------------------------------------------------------------
+
+describe("conferência sinaliza o que não confere com a planilha", () => {
+  it("subtotal impresso diferente da soma das vendas do cliente", () => {
+    const r = analyzeWorkbook(
+      pasta((m) => ({ formato: "texto-br", subtotalErrado: m === 2 ? 999999 : undefined })),
+    );
+    // the revenue stays the sum of the sale rows, never the printed figure
+    expect(centavos(r.periodos[2].totalFaturamento)).toBe(esperadoCentavos[2]);
+    expect(r.conferencia.ok).toBe(false);
+    expect(r.conferencia.abas.map((a) => a.ok)).toEqual([true, true, false, true, true, true]);
+    expect(r.validationReport.valid).toBe(false);
+    expect(r.inconsistencias.some((i) => i.startsWith("Conferência · Aba março 2026"))).toBe(true);
+  });
+
+  it("total impresso na aba diferente do faturamento apurado", () => {
+    const r = analyzeWorkbook(pasta((m) => ({ formato: "numero", totalErrado: m === 5 ? 1 : undefined })));
+    const junho = r.conferencia.abas[5];
+    expect(junho.ok).toBe(false);
+    expect(junho.divergencias.join(" ")).toContain("Totais por unidade");
+    expect(r.validationReport.diagnostics.some((d) => d.layer === "conferencia" && d.severity === "error")).toBe(true);
+  });
+
+  it("valor solto na aba, fora de qualquer cliente", () => {
+    const r = analyzeWorkbook(pasta((m) => ({ formato: "numero", linhaSolta: m === 0 })));
+    const jan = r.conferencia.abas[0];
+    expect(jan.valorDescartado).toBe(123.45);
+    expect(jan.ok).toBe(false);
+    expect(r.conferencia.ok).toBe(false);
+  });
+
+  it("o mesmo mês em duas abas", () => {
+    const nomes = [...ROTULOS];
+    nomes[5] = "maio 2026 (2)";
+    const r = analyzeWorkbook(pasta(() => ({ formato: "numero" }), "xlsx", nomes));
+    expect(r.conferencia.ok).toBe(false);
+    expect(divergencias(r).join(" ")).toContain("o mesmo mês aparece nas abas");
+    // both tabs are still visible as separate columns — none overwrites the other
+    expect(new Set(r.periodos.map((p) => p.nome)).size).toBe(6);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regressões de leitura
+// ---------------------------------------------------------------------------
+
+function abasCruas(abas: Record<string, Celula[][]>): ArrayBuffer {
+  const wb = XLSX.utils.book_new();
+  for (const [n, rows] of Object.entries(abas)) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), n);
+  return paraBuffer(XLSX.write(wb, { type: "array", bookType: "xlsx" }));
+}
+const CAB = ["Código", "Descrição", "UN", "Qtd. venda", "Preço médio venda", "Venda bruta"];
+const abaSimples: Celula[][] = [["Cliente: 1 - A"], CAB, ["10", "X", "UN", 1, 10, 10]];
+
+describe("regressões da leitura das linhas", () => {
+  it("lê 4.200,00 como quatro mil e duzentos em .xls salvo como HTML", () => {
+    const r = analyzeWorkbook(pastaHtml());
+    const alfa = [...r.periodos[0].clientes.values()].find((c) => c.nome === "ALFA COMERCIO LTDA")!;
+    expect(alfa.produtos[0].quantidade).toBe(1200);
+    expect(alfa.produtos[0].valorUnitario).toBe(3.5);
+    expect(alfa.produtos[0].valorTotal).toBe(4200);
+  });
+
+  it('linha "Total:" com valor é subtotal do cliente, não um produto', () => {
+    const r = analyzeWorkbook(
+      abasCruas({
+        junho: [["Cliente: 1 - A"], CAB, ["10", "X", "UN", 2, 5, 10], ["Total:", null, null, 2, null, 10]],
+        julho: abaSimples,
+      }),
+    );
+    const a = [...r.periodos[0].clientes.values()][0];
+    expect(a.produtos).toHaveLength(1);
+    expect(a.totalGeral).toBe(10);
+    expect(a.subtotalImpresso).toBe(10);
+    expect(r.conferencia.ok).toBe(true);
+  });
+
+  it("venda sem código de produto entra no faturamento e é sinalizada", () => {
+    const r = analyzeWorkbook(
+      abasCruas({
+        junho: [["Cliente: 1 - A"], CAB, ["10", "X", "UN", 2, 5, 10], [null, "BRINDE AVULSO", "UN", 1, 7.5, 7.5], [null, null, null, 3, null, 17.5]],
+        julho: abaSimples,
+      }),
+    );
+    expect(r.periodos[0].totalFaturamento).toBe(17.5);
+    expect(r.periodos[0].produtosLidos).toBe(2);
+    expect(r.validationReport.diagnostics.some((d) => d.impact.includes("sem código"))).toBe(true);
+    expect(r.conferencia.ok).toBe(true);
+  });
+
+  it('cabeçalho de cliente com "Cliente:" numa célula e o nome na seguinte', () => {
+    const r = analyzeWorkbook(
+      abasCruas({
+        junho: [["Cliente:", "1 - *ANA", "Fone: (11) 1111-1111"], CAB, ["10", "X", "UN", 1, 10, 10]],
+        julho: abaSimples,
+      }),
+    );
+    const ana = [...r.periodos[0].clientes.values()][0];
+    expect(ana.codigoCliente).toBe("1");
+    expect(ana.nome).toBe("*ANA");
+    expect(ana.fone).toBe("(11) 1111-1111");
+    expect(ana.funcionario).toBe(true);
+  });
+
+  it("produto com o mesmo código e descrição com espaços/caixa diferentes é um só", () => {
+    const r = analyzeWorkbook(
+      abasCruas({
+        junho: [["Cliente: 1 - A"], CAB, ["10", "Arroz  Tipo 1", "UN", 1, 10, 10]],
+        julho: [["Cliente: 1 - A"], CAB, ["10", "ARROZ TIPO 1", "UN", 2, 10, 20]],
+      }),
+    );
+    expect(r.comparativoProdutos).toHaveLength(1);
+    expect(r.comparativoProdutos[0].valorPorPeriodo).toEqual({ junho: 10, julho: 20 });
+  });
+});
+
+describe("importação de novos arquivos", () => {
+  it("cada arquivo importado gera uma apuração independente", () => {
+    const primeiro = analyzeWorkbook(pasta(() => ({ formato: "numero" })));
+    const segundo = analyzeWorkbook(
+      abasCruas({ junho: abaSimples, julho: [["Cliente: 1 - A"], CAB, ["10", "X", "UN", 3, 10, 30]] }),
+    );
+    const terceiro = analyzeWorkbook(pasta(() => ({ formato: "numero" })));
+
+    expect(segundo.periodos.map((p) => p.totalFaturamento)).toEqual([10, 30]);
+    expect(segundo.funcionarios).toEqual([]);
+    expect(terceiro.periodos.map((p) => centavos(p.totalFaturamento))).toEqual(
+      primeiro.periodos.map((p) => centavos(p.totalFaturamento)),
+    );
+  });
+});

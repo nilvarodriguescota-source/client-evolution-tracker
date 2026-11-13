@@ -119,8 +119,8 @@ export function AnalysisResults({ result }: Props) {
         />
         <KpiCard
           title={`Clientes · ${result.periodoAtual.nome}`}
-          value={String(result.periodoAtual.clientes.size)}
-          subtitle={`${result.periodoAnterior.clientes.size} no mês anterior · ${ec.clientesDistintos} distintos na janela`}
+          value={String(result.periodoAtual.clientesCarteira.size)}
+          subtitle={`${result.periodoAnterior.clientesCarteira.size} no mês anterior · ${ec.clientesDistintos} distintos na janela`}
           icon={Users}
           trend={ultimaTransicao?.variacaoClientes ?? undefined}
           color="primary"
@@ -164,7 +164,7 @@ export function AnalysisResults({ result }: Props) {
               <Badge
                 key={p.sheetName}
                 variant="outline"
-                title={`Aba "${p.sheetName}" · ${p.linhasLidas} linhas · ${p.clientes.size} clientes · ${p.produtosLidos} produtos`}
+                title={`Aba "${p.sheetName}" · ${p.linhasLidas} linhas · ${p.clientesCarteira.size} clientes · ${p.funcionarios.size} funcionários · ${p.produtosLidos} registros de venda`}
                 className={
                   i === result.periodos.length - 1
                     ? "border-primary/40 bg-primary/10 text-primary"
@@ -174,7 +174,7 @@ export function AnalysisResults({ result }: Props) {
                 {p.nome}
                 {i === result.periodos.length - 1 && " (atual)"}
                 <span className="ml-1.5 opacity-70">
-                  {p.clientes.size} cli · {p.produtosLidos} prod
+                  {p.clientesCarteira.size} cli · {p.produtosLidos} prod
                 </span>
               </Badge>
             ))}
@@ -230,6 +230,19 @@ export function AnalysisResults({ result }: Props) {
               {errorCount > 0 && ` · ${errorCount} erro${errorCount > 1 ? "s" : ""}`}
               {warningCount > 0 && ` · ${warningCount} aviso${warningCount > 1 ? "s" : ""}`}
             </span>
+            {result.conferencia.ok ? (
+              <p className="text-xs text-muted-foreground">
+                Conferência planilha × sistema: os {result.conferencia.abas.length} meses conferem
+                com a planilha ({fmt(result.conferencia.consolidado.faturamento)} em{" "}
+                {result.conferencia.consolidado.registrosVenda} registros de venda).
+              </p>
+            ) : (
+              <p className="text-xs font-medium text-destructive">
+                Conferência planilha × sistema encontrou{" "}
+                {result.conferencia.itens.filter((i) => !i.ok).length} divergência(s). Os números
+                afetados não conferem com a planilha — veja a aba Validação antes de usá-los.
+              </p>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -648,7 +661,7 @@ export function AnalysisResults({ result }: Props) {
                 </TableHeader>
                 <TableBody>
                   {result.comparativoProdutos.map((p) => (
-                    <TableRow key={p.produto}>
+                    <TableRow key={p.chave}>
                       <TableCell className="font-medium">{p.produto}</TableCell>
                       <TableCell className="text-muted-foreground">{p.codigo}</TableCell>
                       {periodNames.map((n, i) => (
@@ -732,6 +745,7 @@ export function AnalysisResults({ result }: Props) {
                     <TableHead>Identificado por</TableHead>
                     <TableHead className="text-right">Linhas</TableHead>
                     <TableHead className="text-right">Clientes</TableHead>
+                    <TableHead className="text-right">Funcionários</TableHead>
                     <TableHead className="text-right">Produtos</TableHead>
                     <TableHead className="text-right">Faturamento</TableHead>
                   </TableRow>
@@ -755,8 +769,9 @@ export function AnalysisResults({ result }: Props) {
                       <TableCell
                         className={`text-right ${p.clientes.size === 0 ? "font-semibold text-destructive" : ""}`}
                       >
-                        {p.clientes.size}
+                        {p.clientesCarteira.size}
                       </TableCell>
+                      <TableCell className="text-right text-muted-foreground">{p.funcionarios.size}</TableCell>
                       <TableCell className="text-right">{p.produtosLidos}</TableCell>
                       <TableCell className="text-right">{fmt(p.totalFaturamento)}</TableCell>
                     </TableRow>
@@ -764,13 +779,19 @@ export function AnalysisResults({ result }: Props) {
                   {result.leitura.abasIgnoradas.map((a) => (
                     <TableRow key={a.sheetName} className="text-muted-foreground">
                       <TableCell className="font-medium">{a.sheetName}</TableCell>
-                      <TableCell colSpan={6}>Não lida — {a.motivo}</TableCell>
+                      <TableCell colSpan={7}>Não lida — {a.motivo}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
               </Table>
             </CardContent>
           </Card>
+
+          {/* Spreadsheet × processed */}
+          <ConferenciaCard result={result} />
+
+          {/* Employees: in the revenue, out of the client analysis */}
+          <FuncionariosCard result={result} />
 
           {/* Layer summary */}
           <Card>
@@ -1218,6 +1239,10 @@ function TransicaoCard({ t }: { t: TransicaoPeriodo }) {
     { label: "Mantidos que compraram mais", valor: t.ponte.expansao, detalhe: `${t.mantidos.total} mantido(s)` },
     { label: "Mantidos que compraram menos", valor: t.ponte.contracao, detalhe: `${t.mantidos.total} mantido(s)` },
     { label: "Deixaram de comprar", valor: t.ponte.perdidos, detalhe: `${t.perdidos.total} cliente(s)` },
+    // Employees buy, but are not clients: their part keeps the bridge closed.
+    ...(t.ponte.funcionarios !== 0
+      ? [{ label: "Compras de funcionários", valor: t.ponte.funcionarios, detalhe: "fora da carteira" }]
+      : []),
   ];
 
   return (
@@ -1517,6 +1542,183 @@ function periodColor(index: number, total: number): string {
   return `hsl(217 25% ${lightness}%)`;
 }
 
+/**
+ * Conferência planilha × sistema: tab by tab, what the sheet printed against
+ * what the system computed, and every check that did not match.
+ */
+function ConferenciaCard({ result }: { result: AnalysisResult }) {
+  const c = result.conferencia;
+  const falhas = c.itens.filter((i) => !i.ok);
+  const fmtOpc = (v: number | null) =>
+    v === null ? <span className="text-xs text-muted-foreground">não impresso</span> : fmt(v);
+
+  return (
+    <Card className={c.ok ? "" : "border-destructive/50"}>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          {c.ok ? (
+            <ShieldCheck className="h-4 w-4 text-accent" />
+          ) : (
+            <ShieldAlert className="h-4 w-4 text-destructive" />
+          )}
+          Conferência planilha × sistema
+        </CardTitle>
+        <p className="text-xs text-muted-foreground">
+          Faturamento apurado a partir das linhas de venda de cada aba e conferido com os
+          subtotais e totais impressos na própria planilha, com os totais por cliente e por
+          produto e com os comparativos mensais. {c.itens.length - falhas.length} de{" "}
+          {c.itens.length} verificações conferem.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-4 p-0">
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Aba</TableHead>
+                <TableHead className="text-right">Registros</TableHead>
+                <TableHead className="text-right">Clientes</TableHead>
+                <TableHead className="text-right">Funcionários</TableHead>
+                <TableHead className="text-right">Produtos</TableHead>
+                <TableHead className="text-right">Qtd. vendida</TableHead>
+                <TableHead className="text-right">Faturamento apurado</TableHead>
+                <TableHead className="text-right">Subtotais impressos</TableHead>
+                <TableHead className="text-right">Total impresso na aba</TableHead>
+                <TableHead>Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {c.abas.map((a) => (
+                <TableRow key={a.aba}>
+                  <TableCell className="font-medium">
+                    {a.aba}
+                    {a.periodo !== a.aba && (
+                      <span className="ml-1 text-xs text-muted-foreground">({a.periodo})</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right">{a.registrosVenda}</TableCell>
+                  <TableCell className="text-right">{a.clientesCarteira}</TableCell>
+                  <TableCell className="text-right text-muted-foreground">{a.funcionarios}</TableCell>
+                  <TableCell className="text-right">{a.produtosDistintos}</TableCell>
+                  <TableCell className="text-right">
+                    {a.quantidadeTotal.toLocaleString("pt-BR", { maximumFractionDigits: 4 })}
+                  </TableCell>
+                  <TableCell className="text-right font-medium">{fmt(a.faturamentoApurado)}</TableCell>
+                  <TableCell className="text-right">{fmtOpc(a.subtotaisImpressos)}</TableCell>
+                  <TableCell className="text-right">{fmtOpc(a.totalImpresso)}</TableCell>
+                  <TableCell>
+                    {a.ok ? (
+                      <Badge variant="outline" className="border-accent/30 bg-accent/10 text-accent">
+                        Confere
+                      </Badge>
+                    ) : (
+                      <Badge
+                        variant="outline"
+                        className="border-destructive/30 bg-destructive/10 text-destructive"
+                        title={a.divergencias.join("\n")}
+                      >
+                        Divergente
+                      </Badge>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+              <TableRow className="font-semibold">
+                <TableCell>Janela · {c.consolidado.abas} abas</TableCell>
+                <TableCell className="text-right">{c.consolidado.registrosVenda}</TableCell>
+                <TableCell className="text-right">{c.consolidado.clientesDistintos}</TableCell>
+                <TableCell className="text-right">{c.consolidado.funcionariosDistintos}</TableCell>
+                <TableCell className="text-right">{c.consolidado.produtosDistintos}</TableCell>
+                <TableCell className="text-right">
+                  {c.consolidado.quantidadeTotal.toLocaleString("pt-BR", { maximumFractionDigits: 4 })}
+                </TableCell>
+                <TableCell className="text-right">{fmt(c.consolidado.faturamento)}</TableCell>
+                <TableCell colSpan={3} className="text-xs font-normal text-muted-foreground">
+                  clientes e produtos distintos na janela
+                </TableCell>
+              </TableRow>
+            </TableBody>
+          </Table>
+        </div>
+
+        {falhas.length > 0 && (
+          <div className="space-y-1 px-6 pb-5">
+            <p className="text-sm font-semibold text-destructive">
+              Divergências ({falhas.length}) — estes números não conferem com a planilha:
+            </p>
+            {falhas.map((f, i) => (
+              <p key={i} className="text-sm text-muted-foreground">
+                <span className="font-medium text-foreground">{f.escopo}</span> · {f.descricao}:{" "}
+                {f.detalhe}
+              </p>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** Employees found in the file: their purchases are revenue, not clients. */
+function FuncionariosCard({ result }: { result: AnalysisResult }) {
+  const periodos = result.periodos.map((p) => p.nome);
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Users className="h-4 w-4 text-primary" /> Funcionários ({result.funcionarios.length})
+        </CardTitle>
+        <p className="text-xs text-muted-foreground">
+          Identificados pelo asterisco (*) no início do nome. As compras entram no
+          faturamento, nos produtos e nos indicadores de vendas; ficam fora de clientes
+          novos, perdidos, carteira, retenção e ticket médio por cliente.
+        </p>
+      </CardHeader>
+      <CardContent className="p-0">
+        {result.funcionarios.length === 0 ? (
+          <p className="px-6 pb-5 text-sm text-muted-foreground">
+            Nenhum funcionário (*) encontrado no arquivo.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Funcionário</TableHead>
+                  <TableHead>Código</TableHead>
+                  {periodos.map((n) => (
+                    <TableHead key={n} className="text-right capitalize">
+                      {n}
+                    </TableHead>
+                  ))}
+                  <TableHead className="text-right">Total</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {result.funcionarios.map((f) => (
+                  <TableRow key={f.chave}>
+                    <TableCell className="font-medium">{f.nome}</TableCell>
+                    <TableCell className="text-muted-foreground">{f.codigoCliente ?? "—"}</TableCell>
+                    {periodos.map((n) => {
+                      const v = f.faturamentoPorPeriodo[n] ?? 0;
+                      return (
+                        <TableCell key={n} className="text-right">
+                          {v !== 0 ? fmt(v) : <span className="text-xs text-muted-foreground">—</span>}
+                        </TableCell>
+                      );
+                    })}
+                    <TableCell className="text-right font-medium">{fmt(f.faturamentoTotal)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function origemPeriodoLabel(origem: AnalysisResult["periodos"][number]["origemPeriodo"]): string {
   switch (origem) {
     case "nome-da-aba":
@@ -1801,8 +2003,8 @@ function ClientTable({
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {c.produtos.map((p) => (
-                  <TableRow key={p.codigo}>
+                {c.produtos.map((p, i) => (
+                  <TableRow key={`${p.codigo}-${i}`}>
                     <TableCell>{p.produto}</TableCell>
                     <TableCell className="text-muted-foreground">{p.codigo}</TableCell>
                     <TableCell className="text-right">{p.quantidade}</TableCell>

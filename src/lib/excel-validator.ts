@@ -15,6 +15,8 @@
  *   - Aggregation integrity (sum of parts = reported total)
  */
 
+import { lerNumero } from "./numero-br";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -23,7 +25,17 @@ export type ValidationSeverity = "error" | "warning" | "info";
 
 export interface ValidationDiagnostic {
   /** Which layer detected the issue */
-  layer: "existence" | "type" | "integrity" | "structure" | "traceability" | "math" | "duplicate" | "cross-field";
+  layer:
+    | "existence"
+    | "type"
+    | "integrity"
+    | "structure"
+    | "traceability"
+    | "math"
+    | "duplicate"
+    | "cross-field"
+    /** Spreadsheet × processed figures: what the file says against what the system computed */
+    | "conferencia";
   severity: ValidationSeverity;
   /** Excel cell reference (e.g. "Sheet1!B12") */
   cellRef: string;
@@ -170,8 +182,8 @@ export class ExcelValidator {
     const ref = cellRef(this.sheetName, row, col);
 
     if (expectedType === "number") {
-      const num = Number(value);
-      if (value === null || value === undefined || value === "" || Number.isNaN(num)) {
+      // Same reading the analysis uses: "1.234,56" is a number, "abc" is not.
+      if (lerNumero(value) === null) {
         this.fail({
           layer: "type",
           severity: "error",
@@ -397,10 +409,12 @@ export class ExcelValidator {
     row: number,
     context: string,
     tolerance = 0.01,
+    /** Column of the reported total, for the cell reference */
+    col = 5,
   ): { valid: boolean; calculated: number; difference: number } {
     const calculated = preciseMultiply(quantity, unitPrice);
     const difference = preciseRound(Math.abs(calculated - reportedTotal), PRECISION_DIGITS);
-    const ref = cellRef(this.sheetName, row, 5);
+    const ref = cellRef(this.sheetName, row, col);
 
     if (difference > tolerance) {
       this.fail({
@@ -427,10 +441,11 @@ export class ExcelValidator {
     row: number,
     context: string,
     tolerance = 0.01,
+    col = 5,
   ): boolean {
     const calculated = preciseSum(parts);
     const diff = Math.abs(calculated - reportedTotal);
-    const ref = cellRef(this.sheetName, row, 5);
+    const ref = cellRef(this.sheetName, row, col);
 
     if (diff > tolerance) {
       this.fail({
@@ -478,6 +493,39 @@ export class ExcelValidator {
     }
 
     return duplicates;
+  }
+
+  // ---- Conferência: spreadsheet × processed ---------------------------------
+
+  /**
+   * Compares a figure taken from the spreadsheet with the figure the system
+   * computed from it. A divergence is always an error: a number that does not
+   * match the file must never be presented as valid.
+   */
+  checkConferencia(
+    esperado: number,
+    apurado: number,
+    cellRefOrigem: string,
+    field: string,
+    descricao: string,
+    tolerance = 0.005,
+  ): boolean {
+    const diff = preciseRound(Math.abs(esperado - apurado), PRECISION_DIGITS);
+    // NaN (a figure that was never computed) is a divergence, not a pass.
+    if (!(diff <= tolerance)) {
+      this.fail({
+        layer: "conferencia",
+        severity: "error",
+        cellRef: cellRefOrigem,
+        field,
+        actual: `${apurado} (apurado pelo sistema)`,
+        expected: `${esperado} (planilha)`,
+        impact: `${descricao}: divergência de ${diff.toFixed(4)} entre a planilha e o valor processado.`,
+      });
+      return false;
+    }
+    this.pass("conferencia");
+    return true;
   }
 
   // ---- Cross-field consistency -----------------------------------------------

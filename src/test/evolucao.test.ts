@@ -109,6 +109,7 @@ describe("transições mês a mês", () => {
       expansao: 20, // ALFA 100 → 120
       contracao: 0,
       perdidos: -200, // BETA
+      funcionarios: 0,
       total: -130,
     });
     expect(t2.ponte).toEqual({
@@ -117,6 +118,7 @@ describe("transições mês a mês", () => {
       expansao: 0,
       contracao: -30, // ALFA 120 → 90
       perdidos: 0,
+      funcionarios: 0,
       total: 250,
     });
   });
