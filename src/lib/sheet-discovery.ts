@@ -44,7 +44,14 @@ export interface ColumnMap {
   codigo: number;
   descricao: number;
   unidade: number;
+  /** First quantity column — the one the unit price refers to */
   quantidade: number;
+  /**
+   * Every column of the header that holds units sold ("Qtd. venda",
+   * "Qtd. bonificação", …). The quantity sold on a row is the sum of all of
+   * them; `quantidade` is always the first one.
+   */
+  quantidades: number[];
   precoMedio: number;
   vendaBruta: number;
 }
@@ -55,6 +62,7 @@ export const COLUNAS_PADRAO: ColumnMap = {
   descricao: 1,
   unidade: 2,
   quantidade: 3,
+  quantidades: [3],
   precoMedio: 4,
   vendaBruta: 5,
 };
@@ -66,7 +74,9 @@ export const COLUNA_AUSENTE = -1;
  * Header labels, most specific first — the first pattern that matches a cell
  * and whose field is still unassigned wins.
  */
-const PADROES_CABECALHO: { field: keyof ColumnMap; test: RegExp }[] = [
+type CampoUnico = Exclude<keyof ColumnMap, "quantidades">;
+
+const PADROES_CABECALHO: { field: CampoUnico; test: RegExp }[] = [
   { field: "codigo", test: /^(cod|codigo|cod\.)/ },
   { field: "descricao", test: /^(desc|produto|mercadoria|item)/ },
   // "UN", "Und.", "Unid", "Unidade" — never "Unitário", which is a price.
@@ -77,7 +87,26 @@ const PADROES_CABECALHO: { field: keyof ColumnMap; test: RegExp }[] = [
 ];
 
 /** Fields without which a row cannot be read as a product. */
-const CAMPOS_ESSENCIAIS: (keyof ColumnMap)[] = ["codigo", "descricao", "quantidade", "vendaBruta"];
+const CAMPOS_ESSENCIAIS: CampoUnico[] = ["codigo", "descricao", "quantidade", "vendaBruta"];
+
+/** A header that names a quantity of units. */
+const RE_QUANTIDADE = /(^|[^a-z])(qtd|qtde|quant)/;
+/**
+ * Quantity headers that are not units sold: stock, returns, cancellations,
+ * orders, minimums — and anything that is money ("Valor qtd.").
+ */
+const RE_QUANTIDADE_NAO_VENDIDA =
+  /(devol|cancel|estoque|saldo|pedid|minim|maxim|embalag|preco|valor|vlr|r\$|venda bruta|faturamento)/;
+
+/** Header cells that hold units sold, in column order. */
+function colunasDeQuantidade(row: SheetRows[number]): number[] {
+  const cols: number[] = [];
+  for (let col = 0; col < row.length; col++) {
+    const texto = normalizarTexto(row[col]);
+    if (texto && RE_QUANTIDADE.test(texto) && !RE_QUANTIDADE_NAO_VENDIDA.test(texto)) cols.push(col);
+  }
+  return cols;
+}
 
 /**
  * Reads a product header row ("Código | Descrição | UN | Qtd | Preço | Venda").
@@ -86,10 +115,16 @@ const CAMPOS_ESSENCIAIS: (keyof ColumnMap)[] = ["codigo", "descricao", "quantida
 export function lerCabecalhoProdutos(row: SheetRows[number]): ColumnMap | null {
   if (!row) return null;
 
-  const mapa: Partial<ColumnMap> = {};
+  const mapa: Partial<Record<CampoUnico, number>> = {};
   for (let col = 0; col < row.length; col++) {
     const texto = normalizarTexto(row[col]);
     if (!texto) continue;
+    // A quantity header is only ever a quantity: "Qtd. total" is units, not
+    // the value column; "Qtd. devolvida" is not units sold at all.
+    if (RE_QUANTIDADE.test(texto) && !/(preco|valor|vlr|r\$|venda bruta|faturamento)/.test(texto)) {
+      if (mapa.quantidade === undefined && !RE_QUANTIDADE_NAO_VENDIDA.test(texto)) mapa.quantidade = col;
+      continue;
+    }
     for (const { field, test } of PADROES_CABECALHO) {
       if (mapa[field] === undefined && test.test(texto)) {
         mapa[field] = col;
@@ -101,11 +136,18 @@ export function lerCabecalhoProdutos(row: SheetRows[number]): ColumnMap | null {
   // A header row must name the fields the analysis cannot do without.
   if (!CAMPOS_ESSENCIAIS.every((f) => mapa[f] !== undefined)) return null;
 
+  const quantidades = colunasDeQuantidade(row).filter(
+    (c) => c !== mapa.codigo && c !== mapa.descricao && c !== mapa.vendaBruta && c !== mapa.precoMedio,
+  );
+  if (!quantidades.includes(mapa.quantidade!)) quantidades.unshift(mapa.quantidade!);
+  quantidades.sort((a, b) => a - b);
+
   return {
     codigo: mapa.codigo!,
     descricao: mapa.descricao!,
     unidade: mapa.unidade ?? COLUNA_AUSENTE,
     quantidade: mapa.quantidade!,
+    quantidades,
     precoMedio: mapa.precoMedio ?? COLUNA_AUSENTE,
     vendaBruta: mapa.vendaBruta!,
   };
@@ -118,6 +160,7 @@ export function deslocarColunas(offset: number): ColumnMap {
     descricao: COLUNAS_PADRAO.descricao + offset,
     unidade: COLUNAS_PADRAO.unidade + offset,
     quantidade: COLUNAS_PADRAO.quantidade + offset,
+    quantidades: [COLUNAS_PADRAO.quantidade + offset],
     precoMedio: COLUNAS_PADRAO.precoMedio + offset,
     vendaBruta: COLUNAS_PADRAO.vendaBruta + offset,
   };

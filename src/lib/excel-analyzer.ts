@@ -13,7 +13,7 @@ import {
   type SheetRows,
 } from "./sheet-discovery";
 import { lerNumero, ehNumero, paraNumero, somarValores } from "./numero-br";
-import { conferirAnalise, type Conferencia } from "./conferencia";
+import { resumirPlanilha, type Conferencia } from "./conferencia";
 import {
   ExcelValidator,
   preciseMultiply,
@@ -83,29 +83,18 @@ export interface ClientData {
    * sales figures; never in new/lost clients, portfolio or retention.
    */
   funcionario: boolean;
-  /**
-   * Sum of the subtotals the report printed for this client, or null when no
-   * block of the client printed one. Used only to check the revenue — the
-   * revenue itself is the sum of the sale rows.
-   */
-  subtotalImpresso: number | null;
 }
 
-/** Raw-level account of one tab: what the sheet printed and where every value went. */
+/** What one tab of the spreadsheet holds, read straight from its sale rows. */
 export interface LeituraAba {
   /** Sale rows read (one per product line of a client) */
   registrosVenda: number;
+  /** Units sold: Σ of every quantity column over the sale rows only */
   quantidadeTotal: number;
   produtosDistintos: number;
   /** Σ "Venda bruta" of the sale rows — the revenue of the tab */
   faturamentoRegistros: number;
-  /** Σ of the printed client subtotals, when the tab prints them */
-  subtotaisImpressos: number | null;
-  /** Revenue of the client blocks that printed a subtotal (to compare with the above) */
-  faturamentoBlocosComSubtotal: number;
-  /** Total the tab itself prints ("Totais por unidade", "Total geral"), when it does */
-  totalImpresso: { valor: number; origem: string; linha: number } | null;
-  /** Rows carrying a value that could not be placed as a sale, subtotal or total */
+  /** Rows carrying a value that could not be placed as a sale or a total */
   linhasDescartadas: { linha: number; motivo: string; valor: number }[];
 }
 
@@ -273,6 +262,16 @@ export interface PeriodoResumo {
   /** Revenue the perdidos had in the previous month */
   faturamentoPerdidos: number | null;
   taxaRetencao: number | null;
+  /** Units sold in the month (every quantity column of the sale rows) */
+  quantidade: number;
+  /** % change of the units sold vs the previous month; null on the first month */
+  variacaoQuantidade: number | null;
+  /**
+   * Sales movement against the previous month, read from the revenue of the
+   * spreadsheet: "crescimento" (alta), "queda" or "estavel" (within ±5%).
+   * Null on the first month, which has nothing before it.
+   */
+  movimentacao: Tendencia | null;
   /** Employees that bought in the month — outside the client count */
   funcionarios: number;
   /** Their purchases — inside `faturamento` */
@@ -418,7 +417,7 @@ export interface AnalysisResult {
   evolucaoConsolidada: EvolucaoConsolidada;
   /** Employees found in the file, with their purchases (counted in revenue) */
   funcionarios: FuncionarioResumo[];
-  /** Spreadsheet × processed figures, tab by tab and for the whole window */
+  /** What the spreadsheet holds, tab by tab and for the whole window */
   conferencia: Conferencia;
   /** Combined validation report from all layers */
   validationReport: ValidationReport;
@@ -436,11 +435,6 @@ const MATH_TOLERANCE = 0.01;
  * wrong with the sale. The check tolerates exactly that rounding, nothing more.
  */
 const ARREDONDAMENTO_PRECO_POR_UNIDADE = 0.005;
-/** Tolerance for aggregation checks (printed subtotal × sum of the rows) */
-const AGGREGATION_TOLERANCE = 0.01;
-
-/** "Total geral", "Total do relatório": a total of the whole tab. */
-const RE_TOTAL_DA_ABA = /^(total geral|valor total geral|total do relatorio|total da aba|total do periodo)/;
 /** "Totais por unidade:" — the block of per-unit totals that closes the tab. */
 const RE_TOTAIS = /^totais?\b/;
 
@@ -450,7 +444,7 @@ const RE_TOTAIS = /^totais?\b/;
  * products.
  */
 const RE_FIM_DE_BLOCO =
-  /^(totais?\b|total\b|sub-?\s?total|quantidade total|valor total geral)/;
+  /^(totais?\b|total\b|sub-?\s?total|soma\b|somatorio|qtde?\.?\s*total|quantidade total|valor total geral)/;
 
 /**
  * Page furniture. Skipped without closing the block — a paginated export prints
@@ -513,6 +507,46 @@ function primeiroTexto(row: SheetRows[number]): string {
 // Period Parser with full validation
 // ---------------------------------------------------------------------------
 
+/** One block of a client: the values and units of its sale rows so far. */
+interface BlocoCliente {
+  valores: number[];
+  qtds: number[];
+  linha: number;
+}
+
+/**
+ * A line that sums the client instead of selling a product:
+ *   - it names the client itself (its code, or its name in the description), or
+ *   - it has no product code and repeats exactly the units and the value of the
+ *     sales already listed in the block (two or more of them).
+ * Such a line is skipped, so the client's units and value are counted once.
+ */
+function ehSomaDoCliente(
+  cliente: ClientData,
+  blocos: BlocoCliente[],
+  linha: {
+    codigo: string;
+    descricao: string;
+    codigoValido: boolean;
+    qtd: number | null;
+    venda: number | null;
+  },
+): boolean {
+  const bloco = blocos[blocos.length - 1];
+  if (!bloco || bloco.valores.length === 0) return false;
+  if (linha.qtd === null && linha.venda === null) return false;
+
+  const nomeDoCliente =
+    linha.descricao !== "" && normalizarTexto(linha.descricao) === normalizarTexto(cliente.nome);
+  const codigoDoCliente = linha.codigo !== "" && linha.codigo === cliente.codigoCliente && !linha.descricao;
+  if (nomeDoCliente || codigoDoCliente) return true;
+
+  if (linha.codigoValido || bloco.valores.length < 2) return false;
+  const mesmaQtd = linha.qtd === null || Math.abs(linha.qtd - somarValores(bloco.qtds)) < 0.0001;
+  const mesmoValor = linha.venda === null || Math.abs(linha.venda - somarValores(bloco.valores)) < 0.005;
+  return mesmaQtd && mesmoValor;
+}
+
 /**
  * Reads one report tab into a period.
  *
@@ -520,12 +554,12 @@ function primeiroTexto(row: SheetRows[number]): string {
  * indices, so an export that indents the report or renames a column still gets
  * read instead of coming back empty.
  *
- * Every row that carries a value ends up in exactly one place: a sale row of a
- * client, a printed subtotal, a printed total of the tab, or the list of
- * discarded rows — which the conferência reports. Nothing is dropped silently.
+ * Every row that carries a value is either a sale row of a client, a total
+ * (of the client, of a unit or of the tab — never counted), or a discarded row
+ * that is reported. Nothing is dropped silently.
  *
- * The revenue of a client is the sum of its sale rows ("Venda bruta"). The
- * subtotals and totals the report prints are kept only to check that sum.
+ * The revenue of a client is the sum of its sale rows ("Venda bruta"); the
+ * units sold are the sum of every quantity column of those same rows.
  */
 function parsePeriod(aba: AbaDescoberta): PeriodData {
   const { rows, nome } = aba;
@@ -535,20 +569,15 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
   let currentClient: ClientData | null = null;
   /**
    * Blocks of each client — a client listed on two report pages has two blocks.
-   * Each block keeps its own rows and printed subtotal, so the check is done
-   * block by block.
+   * Each keeps the values and units of its sale rows, so a line that repeats
+   * their sum is recognised as the client's total and not counted again.
    */
-  const blocos = new Map<
-    ClientData,
-    { valores: number[]; subtotal: number | null; linha: number }[]
-  >();
+  const blocos = new Map<ClientData, BlocoCliente[]>();
   /** Refreshed every time a product header row shows up in the tab. */
   let colunas: ColumnMap = aba.colunas;
   let produtosLidos = 0;
   /** Inside the "Totais por unidade" block that closes the report */
   let emTotais = false;
-  const totaisImpressos: { valor: number; linha: number }[] = [];
-  const totalGeralImpresso: { valor: number; linha: number }[] = [];
   const linhasDescartadas: LeituraAba["linhasDescartadas"] = [];
 
   // Track client entries for duplicate detection
@@ -561,7 +590,7 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
       excelRow,
       colunas.vendaBruta,
       "linha",
-      "Linha com valor reconhecida como venda, subtotal ou total",
+      "Linha com valor reconhecida como venda ou total",
       `Linha ${excelRow} da aba ${nome}: ${motivo} — valor ${valor} fora do faturamento.`,
     );
   };
@@ -613,7 +642,7 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
       const existente = clientes.get(chave);
       if (existente) {
         currentClient = existente;
-        blocos.get(existente)!.push({ valores: [], subtotal: null, linha: excelRow });
+        blocos.get(existente)!.push({ valores: [], qtds: [], linha: excelRow });
         // A later block may carry fields the first one did not print.
         existente.campos = { ...cliente.campos, ...existente.campos };
         existente.dataUltimaCompra ??= cliente.dataUltimaCompra;
@@ -635,47 +664,58 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
           totalConsistente: true,
           origemLinha: excelRow,
           funcionario: cliente.funcionario,
-          subtotalImpresso: null,
         };
         clientes.set(chave, currentClient);
-        blocos.set(currentClient, [{ valores: [], subtotal: null, linha: excelRow }]);
+        blocos.set(currentClient, [{ valores: [], qtds: [], linha: excelRow }]);
       }
       continue;
     }
 
     const codigo = texto(row, colunas.codigo);
     const descricao = texto(row, colunas.descricao);
-    const qtdLida = lerNumero(celula(row, colunas.quantidade));
+    // Units sold on the row: every quantity column of the header, summed.
+    const qtds = colunas.quantidades.map((c) => lerNumero(celula(row, c)));
+    const qtdLida = qtds.some((q) => q !== null) ? somarValores(qtds.map((q) => q ?? 0)) : null;
+    const qtdPrincipal = lerNumero(celula(row, colunas.quantidade));
     const vendaLida = lerNumero(celula(row, colunas.vendaBruta));
     const temValor = qtdLida !== null || vendaLida !== null;
 
     // A sale row: under a client, with a product code and/or description that is
     // not a totals label, and a quantity or a value. Checked before the summary
     // rows so a product named "TOTAL FLEX 5L" (with its code) is still a sale.
-    const codigoValido = codigo !== "" && !ehRotulo(codigo);
+    const codigoValido = codigo !== "" && !ehRotulo(codigo) && !codigo.includes(":");
     const descricaoValida =
       descricao !== "" && !ehNumero(descricao) && (codigoValido || !ehRotulo(descricao));
+    // "Total do cliente:" printed in any other column marks a totals line.
+    const rotuloNaLinha = row.find(
+      (c, i) => i !== colunas.descricao && typeof c === "string" && ehRotulo(c),
+    );
+    const somaDoCliente =
+      !!currentClient &&
+      ehSomaDoCliente(currentClient, blocos.get(currentClient)!, {
+        codigo,
+        descricao,
+        codigoValido,
+        qtd: qtdLida,
+        venda: vendaLida,
+      });
     const ehProduto =
-      !!currentClient && !emTotais && temValor && (codigoValido || descricaoValida);
+      !!currentClient &&
+      !emTotais &&
+      temValor &&
+      (codigoValido || descricaoValida) &&
+      rotuloNaLinha === undefined &&
+      !somaDoCliente;
 
     // ---- Summary / footer rows ----------------------------------------------
+    // Nothing here is a sale: totals and client sums are skipped, never added
+    // to the revenue or to the units sold.
     if (!ehProduto) {
-      const marcador = primeiroTexto(row);
+      const marcador = rotuloNaLinha !== undefined ? normalizarTexto(rotuloNaLinha) : primeiroTexto(row);
 
       if (RE_FIM_DE_BLOCO.test(marcador)) {
-        if (RE_TOTAL_DA_ABA.test(marcador) || (!currentClient && /^total\b/.test(marcador))) {
-          // "Total geral: 12.345,00" — the tab's own total
-          if (vendaLida !== null) totalGeralImpresso.push({ valor: vendaLida, linha: excelRow });
-        } else if (RE_TOTAIS.test(marcador)) {
-          // "Totais por unidade:" — the per-unit rows that follow add up to the tab
-          emTotais = true;
-          if (vendaLida !== null) totaisImpressos.push({ valor: vendaLida, linha: excelRow });
-        } else if (currentClient && vendaLida !== null) {
-          // "Total do cliente: 1.234,56" — the subtotal of the client's block
-          const bloco = blocos.get(currentClient)!;
-          bloco[bloco.length - 1].subtotal = vendaLida;
-          validator.traceValue(vendaLida, excelRow, colunas.vendaBruta);
-        }
+        // "Totais por unidade:" — the per-unit rows that follow are totals too
+        if (RE_TOTAIS.test(marcador)) emTotais = true;
         // The totals end the client: what follows is not that client's products.
         currentClient = null;
         continue;
@@ -686,28 +726,21 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
         continue;
       }
 
-      if (emTotais) {
-        // "UN | | | 120 | | 4.500,00" — one unit's total
-        if (vendaLida !== null) totaisImpressos.push({ valor: vendaLida, linha: excelRow });
+      // "UN | | | 120 | | 4.500,00" — one unit's total
+      if (emTotais) continue;
+
+      // Sum of the client's rows (no product, or the client itself, or the very
+      // sum of the block): already counted in the sales above it.
+      if (currentClient && temValor && ((codigo === "" && descricao === "") || somaDoCliente)) {
         continue;
       }
 
-      // ---- Subtotal row: values with no code and no description -------------
-      if (currentClient && codigo === "" && descricao === "" && vendaLida !== null) {
-        const bloco = blocos.get(currentClient)!;
-        bloco[bloco.length - 1].subtotal = vendaLida;
-        // Layer 5: trace the subtotal
-        validator.traceValue(vendaLida, excelRow, colunas.vendaBruta);
-        continue;
-      }
-
-      // A value that is neither a sale, a subtotal nor a total: never dropped
-      // quietly — it goes to the conferência as a discarded value.
+      // A value that is neither a sale nor a total: never dropped quietly.
       if (vendaLida !== null && vendaLida !== 0) {
         descartar(
           excelRow,
           currentClient
-            ? "linha com valor que não é produto nem subtotal"
+            ? "linha com valor que não é produto nem somatório do cliente"
             : "linha com valor fora de qualquer bloco de cliente",
           vendaLida,
         );
@@ -770,14 +803,17 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
       validator.checkType(celula(row, colunas.precoMedio), "number", excelRow, colunas.precoMedio, "precoMedio");
     }
 
+    // Units sold: the sum of every quantity column of the row.
     const quantidade = qtdLida ?? 0;
+    // The average price refers to the first quantity column ("Qtd. venda").
+    const quantidadePrincipal = qtdPrincipal ?? 0;
     const vendaBruta = vendaLida ?? 0;
     // Without a unit-price column the average price is derived, never invented.
     const precoMedio =
       colunas.precoMedio !== COLUNA_AUSENTE
         ? paraNumero(celula(row, colunas.precoMedio))
-        : quantidade !== 0
-          ? preciseRound(vendaBruta / quantidade, 4)
+        : quantidadePrincipal !== 0
+          ? preciseRound(vendaBruta / quantidadePrincipal, 4)
           : 0;
 
     // Traceability for numeric values
@@ -796,7 +832,7 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
 
     // Cross-field: if qty > 0 then price should > 0 and vice versa
     validator.checkCrossField(
-      !(quantidade > 0 && precoMedio === 0),
+      !(quantidadePrincipal > 0 && precoMedio === 0),
       excelRow,
       tPrecoMedio.origin.col,
       "precoMedio",
@@ -807,12 +843,12 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
     // Math consistency: qty × price = total, within the rounding of the
     // printed average price.
     const mathCheck = validator.checkMathConsistency(
-      quantidade,
+      quantidadePrincipal,
       precoMedio,
       vendaBruta,
       excelRow,
       `${client.nome} → Produto ${codigoProduto || descricaoProduto}`,
-      MATH_TOLERANCE + Math.abs(quantidade) * ARREDONDAMENTO_PRECO_POR_UNIDADE,
+      MATH_TOLERANCE + Math.abs(quantidadePrincipal) * ARREDONDAMENTO_PRECO_POR_UNIDADE,
       colunas.vendaBruta,
     );
 
@@ -837,6 +873,7 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
     });
     const bloco = blocos.get(client)!;
     bloco[bloco.length - 1].valores.push(vendaBruta);
+    bloco[bloco.length - 1].qtds.push(quantidade);
     produtosLidos++;
   }
 
@@ -844,34 +881,11 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
   validator.checkDuplicates(clientEntries, `Periodo ${nome}`);
 
   // ---- Revenue per client: the sum of its sale rows ----------------------------
-  let subtotaisImpressos: number | null = null;
-  let faturamentoBlocosComSubtotal = 0;
   for (const c of clientes.values()) {
     const productValues = c.produtos.map((p) => p.valorTotal);
     const sumProdutos = somarValores(productValues);
     c.totalRecalculado = sumProdutos;
     c.totalGeral = sumProdutos;
-
-    // Printed subtotals check the rows, block by block.
-    const impressos: number[] = [];
-    for (const b of blocos.get(c) ?? []) {
-      if (b.subtotal === null) continue;
-      impressos.push(b.subtotal);
-      faturamentoBlocosComSubtotal += somarValores(b.valores);
-      const ok = validator.checkAggregation(
-        b.valores,
-        b.subtotal,
-        b.linha,
-        `${nome} → ${c.nome}`,
-        AGGREGATION_TOLERANCE,
-        colunas.vendaBruta,
-      );
-      if (!ok) c.totalConsistente = false;
-    }
-    if (impressos.length) {
-      c.subtotalImpresso = somarValores(impressos);
-      subtotaisImpressos = somarValores([subtotaisImpressos ?? 0, c.subtotalImpresso]);
-    }
 
     // Duplicate product detection within same client
     const prodEntries = c.produtos.map((p) => ({
@@ -891,19 +905,6 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
   const faturamentoFuncionarios = somarValores([...funcionarios.values()].map((c) => c.totalGeral));
 
   const vendas = todos.flatMap((c) => c.produtos);
-  const totalImpresso = totalGeralImpresso.length
-    ? {
-        valor: somarValores(totalGeralImpresso.map((t) => t.valor)),
-        origem: "Total geral",
-        linha: totalGeralImpresso[0].linha,
-      }
-    : totaisImpressos.length
-      ? {
-          valor: somarValores(totaisImpressos.map((t) => t.valor)),
-          origem: "Totais por unidade",
-          linha: totaisImpressos[0].linha,
-        }
-      : null;
 
   return {
     nome,
@@ -919,9 +920,6 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
       quantidadeTotal: somarValores(vendas.map((p) => p.quantidade)),
       produtosDistintos: new Set(vendas.map((p) => chaveDoProduto(p.codigo, p.produto))).size,
       faturamentoRegistros: somarValores(vendas.map((p) => p.valorTotal)),
-      subtotaisImpressos,
-      faturamentoBlocosComSubtotal: preciseRound(faturamentoBlocosComSubtotal, 4),
-      totalImpresso,
       linhasDescartadas,
     },
     validationReport: validator.getReport(),
@@ -1279,6 +1277,11 @@ function resumirEvolucao(
       faturamentoNovos: t ? t.novos.faturamento : null,
       faturamentoPerdidos: t ? t.perdidos.faturamento : null,
       taxaRetencao: t ? t.taxaRetencao : null,
+      quantidade: p.leituraAba.quantidadeTotal,
+      variacaoQuantidade:
+        i > 0 ? variacao(periodos[i - 1].leituraAba.quantidadeTotal, p.leituraAba.quantidadeTotal) : null,
+      movimentacao:
+        i > 0 ? tendenciaDaSerie([periodos[i - 1].totalFaturamento, p.totalFaturamento]).tendencia : null,
       funcionarios: p.funcionarios.size,
       faturamentoFuncionarios: p.faturamentoFuncionarios,
     };
@@ -1517,15 +1520,6 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
           );
         }
       }
-      if (!c.totalConsistente) {
-        const impresso = c.subtotalImpresso ?? 0;
-        inconsistencias.push(
-          `${period.nome} → ${c.nome}: ` +
-          `Subtotal impresso (${toDisplay(impresso).toFixed(2)}) ≠ ` +
-          `Soma das vendas (${toDisplay(c.totalRecalculado).toFixed(2)}) ` +
-          `[Divergência: R$ ${Math.abs(impresso - c.totalRecalculado).toFixed(4)}]`
-        );
-      }
     }
     for (const d of period.leituraAba.linhasDescartadas) {
       inconsistencias.push(
@@ -1545,30 +1539,16 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
   const evolucaoConsolidada = consolidarEvolucao(periodos, transicoes, classificacaoCarteira);
   const funcionarios = resumirFuncionarios(periodos);
 
-  // ---- Conferência: spreadsheet × processed figures ---------------------------
-  // Re-checks every figure the screens show against what the tabs printed and
-  // against each other. A divergence is an error in the validation report and an
-  // alert — never a number shown as valid.
-  const conferencia = conferirAnalise({
-    periodos,
-    comparativoProdutos,
-    classificacaoCarteira,
-    carteira,
-    transicoes,
-    evolucaoPeriodos,
-    evolucaoConsolidada,
-    funcionarios,
-    periodosRepetidos: descoberta.periodosRepetidos,
-  });
-  for (const item of conferencia.itens) {
-    if (!item.ok) inconsistencias.push(`Conferência · ${item.escopo} → ${item.descricao}: ${item.detalhe}`);
-  }
+  // ---- Conferência: what the spreadsheet holds, tab by tab ---------------------
+  // Read straight from the sale rows; nothing is compared with or corrected by
+  // anything outside the spreadsheet.
+  const conferencia = resumirPlanilha(periodos);
 
   // ---- Merge validation reports into one combined report ----------------------
   // Covers every period read from the file: a month left out of the validation
   // is a month nobody checked, which is how a whole tab used to go missing
   // without a single alert.
-  const relatorios = [...periodos.map((p) => p.validationReport), conferencia.validationReport];
+  const relatorios = periodos.map((p) => p.validationReport);
   const allDiagnostics = relatorios.flatMap((r) => r.diagnostics);
   const totalChecks = relatorios.reduce((s, r) => s + r.totalChecks, 0);
   const passedChecks = relatorios.reduce((s, r) => s + r.passedChecks, 0);
@@ -1589,6 +1569,21 @@ export function analyzeWorkbook(buffer: ArrayBuffer): AnalysisResult {
           `foi reconhecido — o período entra na análise zerado. Confira o layout dessa aba.`,
       });
     }
+  }
+
+  // The same month in two tabs would be counted twice in the window.
+  for (const r of descoberta.periodosRepetidos) {
+    allDiagnostics.push({
+      layer: "structure",
+      severity: "error",
+      cellRef: `${r.abas[1]}!A1`,
+      field: `mês ${r.periodo}`,
+      actual: `abas ${r.abas.map((a) => `"${a}"`).join(", ")}`,
+      expected: "uma aba por mês",
+      impact:
+        `O mês ${r.periodo} aparece em mais de uma aba (${r.abas.join(", ")}) — ` +
+        `as vendas desse mês seriam contadas mais de uma vez na janela.`,
+    });
   }
 
   const layerSummary: Record<string, { passed: number; failed: number }> = {};
