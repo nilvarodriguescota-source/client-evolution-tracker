@@ -628,6 +628,14 @@ describe("quantidade vendida", () => {
     ["repetindo a soma das vendas do bloco", [null, "TOTAL", null, 5, null, 50]],
     ["sem rótulo, repetindo a soma das vendas", [null, "  ", null, 5, null, 50]],
     ['com "Qtde. total:" no código', ["Qtde. total:", null, null, 5, null, 50]],
+    ["com a unidade de medida na coluna de código", ["UN", null, null, 5, null, 50]],
+    ["com a unidade de medida e só a quantidade", ["UN", null, null, 5, null, null]],
+    ["só com a quantidade", [null, null, null, 5, null, null]],
+    ["com a unidade de medida na coluna de descrição", [null, "UN", null, 5, null, 50]],
+    ["com a unidade de medida em todas as colunas de texto", ["KG", "KG", "KG", 5, null, 50]],
+    ["com um número na coluna de código", [5, null, null, 5, null, 50]],
+    ["com código mas sem produto", ["10", null, null, 5, null, 50]],
+    ["com código e nome do cliente", [null, "1 - ALFA LTDA", null, 5, null, 50]],
   ])("não conta de novo o somatório do cliente %s", (_, linhaSoma) => {
     const r = analyzeWorkbook(
       abasCruas({
@@ -647,6 +655,49 @@ describe("quantidade vendida", () => {
     expect(qtd(r)).toBe(5);
     expect(r.periodos[0].produtosLidos).toBe(2);
     expect(r.periodos[0].totalFaturamento).toBe(50);
+    expect(r.evolucaoPeriodos[0].quantidade).toBe(5);
+    expect(r.conferencia.abas[0].quantidadeTotal).toBe(5);
+    // the client's own sum is not an error of the spreadsheet
+    expect(r.inconsistencias).toEqual([]);
+  });
+
+  it("soma a Qtd. venda de cada produto de vários clientes, cada um com seu somatório abaixo", () => {
+    // as the report prints it: products of the client, then the client's sum
+    const r = analyzeWorkbook(
+      abasCruas({
+        junho: [
+          ["Vendas de produto no período"],
+          ["Cliente: 1001 - ALFA LTDA"],
+          CAB,
+          ["5001", "ARROZ 5KG", "UN", 120, 3.5, 420],
+          ["5002", "FEIJAO 1KG", "UN", 50, 8, 400],
+          ["5010", "CARNE BOVINA", "KG", 12.5, 40, 500],
+          ["UN", null, null, 182.5, null, 1320],
+          [],
+          ["Cliente: 1002 - BETA MERCEARIA"],
+          CAB,
+          ["5004", "OLEO 900ML", "CX", 3, 100, 300],
+          [null, null, "CX", 3, null, 300],
+          [],
+          ["Cliente: 2001 - *MARIA SILVA"],
+          CAB,
+          ["5007", "CAFE 500G", "UN", 2, 15.5, 31],
+          [null, null, null, 2, null, 31],
+          [],
+          ["Totais por unidade:"],
+          ["UN", null, null, 172, null, 851],
+          ["KG", null, null, 12.5, null, 500],
+          ["CX", null, null, 3, null, 300],
+        ],
+        julho: abaSimples,
+      }),
+    );
+    // 120 + 50 + 12,5 + 3 + 2 — each product's Qtd. venda, once
+    expect(qtd(r)).toBe(187.5);
+    expect(r.evolucaoPeriodos[0].quantidade).toBe(187.5);
+    expect(r.conferencia.abas[0].quantidadeTotal).toBe(187.5);
+    expect(r.periodos[0].produtosLidos).toBe(5);
+    expect(r.periodos[0].totalFaturamento).toBe(1651);
   });
 
   it("conta cada venda uma única vez, inclusive com o cliente em dois blocos", () => {

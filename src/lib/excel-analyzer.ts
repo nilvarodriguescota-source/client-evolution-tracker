@@ -507,6 +507,17 @@ function primeiroTexto(row: SheetRows[number]): string {
 // Period Parser with full validation
 // ---------------------------------------------------------------------------
 
+/**
+ * Units of measure the reports print ("UN", "KG", "CX"…). A cell holding only
+ * one of them names a unit, never a product.
+ */
+const RE_UNIDADE_DE_MEDIDA =
+  /^(un|und|unid|unidade|kg|g|gr|mg|cx|caixa|pc|pç|pca|peca|pct|pacote|lt|l|litro|ml|mt|m|m2|m3|metro|fd|fardo|dz|duzia|sc|saco|bd|bdj|bandeja|gl|galao|par|jg|jogo|kit|rl|rolo|tb|bj|fr|frasco|cj|conjunto|ct|cartela|pt|pote|lata|lta|un\.?\s*med\.?)\.?$/;
+
+function ehUnidadeDeMedida(valor: string): boolean {
+  return RE_UNIDADE_DE_MEDIDA.test(normalizarTexto(valor));
+}
+
 /** One block of a client: the values and units of its sale rows so far. */
 interface BlocoCliente {
   valores: number[];
@@ -536,8 +547,15 @@ function ehSomaDoCliente(
   if (!bloco || bloco.valores.length === 0) return false;
   if (linha.qtd === null && linha.venda === null) return false;
 
-  const nomeDoCliente =
-    linha.descricao !== "" && normalizarTexto(linha.descricao) === normalizarTexto(cliente.nome);
+  const descricao = normalizarTexto(linha.descricao);
+  const nome = normalizarTexto(cliente.nome);
+  // "ALFA LTDA" or "1001 - ALFA LTDA" in the description: the client itself.
+  // Only a whole, real name counts — "A" inside "BRINDE AVULSO" does not.
+  const contemNome =
+    nome.length >= 5 &&
+    !linha.codigoValido &&
+    ` ${descricao.replace(/[^a-z0-9*]+/g, " ")} `.includes(` ${nome.replace(/[^a-z0-9*]+/g, " ")} `);
+  const nomeDoCliente = descricao !== "" && (descricao === nome || contemNome);
   const codigoDoCliente = linha.codigo !== "" && linha.codigo === cliente.codigoCliente && !linha.descricao;
   if (nomeDoCliente || codigoDoCliente) return true;
 
@@ -678,12 +696,18 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
     const vendaLida = lerNumero(celula(row, colunas.vendaBruta));
     const temValor = qtdLida !== null || vendaLida !== null;
 
-    // A sale row: under a client, with a product code and/or description that is
-    // not a totals label, and a quantity or a value. Checked before the summary
-    // rows so a product named "TOTAL FLEX 5L" (with its code) is still a sale.
-    const codigoValido = codigo !== "" && !ehRotulo(codigo) && !codigo.includes(":");
+    // A sale row: under a client, naming a PRODUCT (its description) with the
+    // quantity sold. A line without a product — only a code, a unit of measure
+    // ("UN", "KG") or numbers — is the sum of the client printed below its
+    // sales, never a sale. Checked before the summary rows so a product named
+    // "TOTAL FLEX 5L" (with its code) is still a sale.
+    const codigoValido =
+      codigo !== "" && !ehRotulo(codigo) && !codigo.includes(":") && !ehUnidadeDeMedida(codigo);
     const descricaoValida =
-      descricao !== "" && !ehNumero(descricao) && (codigoValido || !ehRotulo(descricao));
+      descricao !== "" &&
+      !ehNumero(descricao) &&
+      !ehUnidadeDeMedida(descricao) &&
+      (codigoValido || !ehRotulo(descricao));
     // "Total do cliente:" printed in any other column marks a totals line.
     const rotuloNaLinha = row.find(
       (c, i) => i !== colunas.descricao && typeof c === "string" && ehRotulo(c),
@@ -701,7 +725,7 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
       !!currentClient &&
       !emTotais &&
       temValor &&
-      (codigoValido || descricaoValida) &&
+      descricaoValida &&
       rotuloNaLinha === undefined &&
       !somaDoCliente;
 
@@ -727,9 +751,10 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
       // "UN | | | 120 | | 4.500,00" — one unit's total
       if (emTotais) continue;
 
-      // Sum of the client's rows (no product, or the client itself, or the very
-      // sum of the block): already counted in the sales above it.
-      if (currentClient && temValor && ((codigo === "" && descricao === "") || somaDoCliente)) {
+      // Sum of the client's rows, printed below its sales (no product, the
+      // client itself, a unit of measure, or the very sum of the block): its
+      // units and value are already in the sales above it.
+      if (currentClient && temValor && (!descricaoValida || somaDoCliente)) {
         continue;
       }
 
@@ -749,21 +774,21 @@ function parsePeriod(aba: AbaDescoberta): PeriodData {
     // ---- Sale row -------------------------------------------------------------
     const client = currentClient!;
 
-    // A sale row missing its code or its description still is a sale: it counts
-    // in the revenue and is flagged so the source can be fixed.
-    if (!codigoValido || !descricaoValida) {
+    // A sale row missing its product code still is a sale: it counts in the
+    // revenue and is flagged so the source can be fixed.
+    if (!codigoValido) {
       validator.checkCrossField(
         false,
         excelRow,
-        codigoValido ? colunas.descricao : colunas.codigo,
-        codigoValido ? "descricao" : "codigo",
+        colunas.codigo,
+        "codigo",
         "Linha de venda com código e descrição do produto",
-        `Linha ${excelRow} da aba ${nome}: venda ${codigoValido ? `do código ${codigo} sem descrição` : `de "${descricao}" sem código`} — ` +
+        `Linha ${excelRow} da aba ${nome}: venda de "${descricao}" sem código — ` +
           `contada no faturamento; confira a linha na planilha.`,
       );
     }
     const codigoProduto = codigoValido ? codigo : "";
-    const descricaoProduto = descricaoValida ? descricao : `(sem descrição) ${codigo}`;
+    const descricaoProduto = descricao;
 
     // Layer 4: Structure — the row must reach the value column
     if (
