@@ -722,6 +722,53 @@ describe("quantidade vendida", () => {
   });
 });
 
+describe("layout real do relatório de vendas", () => {
+  // As the ERP exports it: the product header once at the top, a "Cliente:" line
+  // per client, its products, a sum line ("" code) only when the client bought
+  // two or more items, then the tab's grand total and the per-unit totals —
+  // printed without a label and shifted: unit | qty | qty | VALUE | 0 | 0.
+  const aba = (fator: number): Celula[][] => [
+    ["Código", "Descrição", "UN", "Qtd. venda", "Preço médio venda", "Venda bruta"],
+    [null, null, null, null, null, null],
+    ["Cliente: 22908 - *ANA MARIA - Data da última compra: 08/05/2026", null, null, null, null, null],
+    [null, null, null, null, null, null],
+    ["2275", "(UAI) PAO DE BATATA REQUEIJAO 20 UND", "PCT", 2 * fator, 83.18, 166.36 * fator],
+    [null, null, null, null, null, null],
+    ["Cliente: 1001 - PADARIA ALFA - Data da última compra: 15/05/2026 - Celular: (0xx48)99999-0000", null, null, null, null, null],
+    [null, null, null, null, null, null],
+    ["3046", "(NEVASCA) MINI CROISSANT CHOCOLATE 1KG", "PCT", 2 * fator, 43.62, 87.24 * fator],
+    ["5531", "(O PADEIRO) PUDIM LEITE MOÇA 135G 12 UND", "CX", 1 * fator, 70, 70 * fator],
+    ["1158", "(FERFUR) MINI BOLINHA QUEIJO 1,5KG", "KG", 3 * fator, 10, 30 * fator],
+    ["", null, null, 6 * fator, null, 187.24 * fator],
+    [null, null, null, null, null, null],
+    ["", null, null, 8 * fator, null, 353.6 * fator],
+    [null, null, null, null, null, null],
+    ["PCT", 4 * fator, 4 * fator, 253.6 * fator, 0, 0],
+    ["CX", 1 * fator, 1 * fator, 70 * fator, 0, 0],
+    ["KG", 3 * fator, 3 * fator, 30 * fator, 0, 0],
+    ["BANDEJ", 0, 0, 0, 0, 0],
+    [null, null, null, null, null, null],
+    ["Quantidade total de clientes listados: 2", null, null, null, null, null],
+    ["Gerado em 13/11/26 09:46:15", null, null, null, null, null],
+  ];
+
+  it("soma só a Qtd. venda dos produtos: sem a soma do cliente, o total geral e os totais por unidade", () => {
+    const r = analyzeWorkbook(abasCruas({ maio: aba(1), junho: aba(2) }));
+    // 2 + 2 + 1 + 3 — the sum lines (6, 8) and the per-unit rows (whose third
+    // number is money, R$ 253,60) are never counted as units
+    expect(r.periodos.map((p) => p.leituraAba.quantidadeTotal)).toEqual([8, 16]);
+    expect(r.evolucaoPeriodos.map((p) => p.quantidade)).toEqual([8, 16]);
+    expect(r.conferencia.abas.map((a) => a.quantidadeTotal)).toEqual([8, 16]);
+    expect(r.periodos.map((p) => p.totalFaturamento)).toEqual([353.6, 707.2]);
+    expect(r.periodos.map((p) => p.produtosLidos)).toEqual([4, 4]);
+    // 1 client + 1 employee = the 2 clients listed by the report
+    expect(r.periodos[0].clientesCarteira.size).toBe(1);
+    expect(r.periodos[0].funcionarios.size).toBe(1);
+    expect(r.inconsistencias).toEqual([]);
+    expect(r.validationReport.valid).toBe(true);
+  });
+});
+
 describe("movimentação de vendas entre os meses", () => {
   it("aponta alta, queda e estabilidade a partir do faturamento da planilha", () => {
     const aba = (valor: number): Celula[][] => [["Cliente: 1 - A"], CAB, ["10", "X", "UN", 1, valor, valor]];

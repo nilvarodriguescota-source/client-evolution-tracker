@@ -512,7 +512,7 @@ function primeiroTexto(row: SheetRows[number]): string {
  * one of them names a unit, never a product.
  */
 const RE_UNIDADE_DE_MEDIDA =
-  /^(un|und|unid|unidade|kg|g|gr|mg|cx|caixa|pc|pç|pca|peca|pct|pacote|lt|l|litro|ml|mt|m|m2|m3|metro|fd|fardo|dz|duzia|sc|saco|bd|bdj|bandeja|gl|galao|par|jg|jogo|kit|rl|rolo|tb|bj|fr|frasco|cj|conjunto|ct|cartela|pt|pote|lata|lta|un\.?\s*med\.?)\.?$/;
+  /^(un|und|unid|unidade|kg|g|gr|mg|cx|caixa|pc|pç|pca|peca|pct|pacote|lt|l|litro|ml|mt|m|m2|m3|metro|fd|fardo|dz|duzia|sc|saco|bd|bdj|bandej|bandeja|gl|galao|par|jg|jogo|kit|rl|rolo|tb|bj|fr|frasco|cj|conjunto|ct|cartela|pt|pote|lata|lta|un\.?\s*med\.?)\.?$/;
 
 function ehUnidadeDeMedida(valor: string): boolean {
   return RE_UNIDADE_DE_MEDIDA.test(normalizarTexto(valor));
