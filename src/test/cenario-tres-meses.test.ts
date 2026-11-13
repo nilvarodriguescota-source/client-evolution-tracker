@@ -185,12 +185,9 @@ describe("cenário real · junho + julho + agosto", () => {
     // traceable back to the exact cell of the junho tab
     expect(alertasJunho[0]).toMatch(/junho!F\d+/);
 
-    // the validation report covers the three tabs, not just the two compared,
-    // plus the conferência planilha × sistema
+    // the validation report covers the three tabs, not just the two compared
     const checksDosPeriodos = r.periodos.reduce((s, p) => s + p.validationReport.totalChecks, 0);
-    expect(r.validationReport.totalChecks).toBe(
-      checksDosPeriodos + r.conferencia.validationReport.totalChecks,
-    );
+    expect(r.validationReport.totalChecks).toBe(checksDosPeriodos);
     expect(r.validationReport.diagnostics.some((d) => d.cellRef.startsWith("junho!"))).toBe(true);
   });
 

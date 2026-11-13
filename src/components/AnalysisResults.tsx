@@ -66,6 +66,9 @@ const fmt = (v: number) =>
     maximumFractionDigits: 2,
   });
 
+/** Units sold, Brazilian format, without trailing zeros. */
+const fmtQtd = (v: number) => v.toLocaleString("pt-BR", { maximumFractionDigits: 4 });
+
 export function AnalysisResults({ result }: Props) {
   const [tab, setTab] = useState("resumo");
 
@@ -230,19 +233,13 @@ export function AnalysisResults({ result }: Props) {
               {errorCount > 0 && ` · ${errorCount} erro${errorCount > 1 ? "s" : ""}`}
               {warningCount > 0 && ` · ${warningCount} aviso${warningCount > 1 ? "s" : ""}`}
             </span>
-            {result.conferencia.ok ? (
-              <p className="text-xs text-muted-foreground">
-                Conferência planilha × sistema: os {result.conferencia.abas.length} meses conferem
-                com a planilha ({fmt(result.conferencia.consolidado.faturamento)} em{" "}
-                {result.conferencia.consolidado.registrosVenda} registros de venda).
-              </p>
-            ) : (
-              <p className="text-xs font-medium text-destructive">
-                Conferência planilha × sistema encontrou{" "}
-                {result.conferencia.itens.filter((i) => !i.ok).length} divergência(s). Os números
-                afetados não conferem com a planilha — veja a aba Validação antes de usá-los.
-              </p>
-            )}
+            <p className="text-xs text-muted-foreground">
+              Dados da planilha: {result.conferencia.abas.length}{" "}
+              {result.conferencia.abas.length === 1 ? "mês" : "meses"} ·{" "}
+              {fmt(result.conferencia.consolidado.faturamento)} em{" "}
+              {result.conferencia.consolidado.registrosVenda} registros de venda ·{" "}
+              {fmtQtd(result.conferencia.consolidado.quantidadeTotal)} unidades vendidas.
+            </p>
           </div>
         </CardContent>
       </Card>
@@ -298,6 +295,8 @@ export function AnalysisResults({ result }: Props) {
                       <TableHead>Mês</TableHead>
                       <TableHead className="text-right">Faturamento</TableHead>
                       <TableHead className="text-right">Var. Faturamento</TableHead>
+                      <TableHead>Movimentação</TableHead>
+                      <TableHead className="text-right">Qtd. Vendida</TableHead>
                       <TableHead className="text-right">Clientes</TableHead>
                       <TableHead className="text-right">Var. Clientes</TableHead>
                       <TableHead className="text-right">Ticket Médio</TableHead>
@@ -326,6 +325,20 @@ export function AnalysisResults({ result }: Props) {
                         <TableCell className="text-right font-medium">{fmt(p.faturamento)}</TableCell>
                         <TableCell className="text-right">
                           <VariationCell value={p.variacaoFaturamento} />
+                        </TableCell>
+                        <TableCell>
+                          {p.movimentacao === null ? (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          ) : (
+                            <MovimentacaoBadge tendencia={p.movimentacao} />
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right" title={
+                          p.variacaoQuantidade === null
+                            ? undefined
+                            : `${pct(p.variacaoQuantidade)} vs mês anterior`
+                        }>
+                          {fmtQtd(p.quantidade)}
                         </TableCell>
                         <TableCell className="text-right">{p.clientes}</TableCell>
                         <TableCell className="text-right">
@@ -959,6 +972,23 @@ const TENDENCIA_CONFIG: Record<Tendencia, { label: string; className: string; Ic
   },
 };
 
+/** Sales movement of a month against the one before: alta, queda or estável. */
+const MOVIMENTACAO_LABEL: Record<Tendencia, string> = {
+  crescimento: "Alta",
+  queda: "Queda",
+  estavel: "Estável",
+};
+
+function MovimentacaoBadge({ tendencia }: { tendencia: Tendencia }) {
+  const { className, Icon } = TENDENCIA_CONFIG[tendencia];
+  return (
+    <Badge variant="outline" className={`gap-1 ${className}`}>
+      <Icon className="h-3 w-3" />
+      {MOVIMENTACAO_LABEL[tendencia]}
+    </Badge>
+  );
+}
+
 function TendenciaBadge({ tendencia }: { tendencia: Tendencia }) {
   const { label, className, Icon } = TENDENCIA_CONFIG[tendencia];
   return (
@@ -1543,31 +1573,25 @@ function periodColor(index: number, total: number): string {
 }
 
 /**
- * Conferência planilha × sistema: tab by tab, what the sheet printed against
- * what the system computed, and every check that did not match.
+ * Conferência: what each tab of the spreadsheet holds — sale rows, buyers,
+ * products, units sold and revenue — read straight from the sale rows. The
+ * spreadsheet is the only source: nothing is compared with anything else.
  */
 function ConferenciaCard({ result }: { result: AnalysisResult }) {
   const c = result.conferencia;
-  const falhas = c.itens.filter((i) => !i.ok);
-  const fmtOpc = (v: number | null) =>
-    v === null ? <span className="text-xs text-muted-foreground">não impresso</span> : fmt(v);
+  const comDescarte = c.abas.filter((a) => a.linhasDescartadas > 0);
 
   return (
-    <Card className={c.ok ? "" : "border-destructive/50"}>
+    <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-base">
-          {c.ok ? (
-            <ShieldCheck className="h-4 w-4 text-accent" />
-          ) : (
-            <ShieldAlert className="h-4 w-4 text-destructive" />
-          )}
-          Conferência planilha × sistema
+          <FileSpreadsheet className="h-4 w-4 text-primary" />
+          Conferência dos dados da planilha
         </CardTitle>
         <p className="text-xs text-muted-foreground">
-          Faturamento apurado a partir das linhas de venda de cada aba e conferido com os
-          subtotais e totais impressos na própria planilha, com os totais por cliente e por
-          produto e com os comparativos mensais. {c.itens.length - falhas.length} de{" "}
-          {c.itens.length} verificações conferem.
+          Números de cada aba, apurados somente das linhas de venda da planilha. A
+          quantidade vendida soma todas as colunas de quantidade dessas linhas, sem os
+          totais por cliente, por unidade ou da aba.
         </p>
       </CardHeader>
       <CardContent className="space-y-4 p-0">
@@ -1581,10 +1605,7 @@ function ConferenciaCard({ result }: { result: AnalysisResult }) {
                 <TableHead className="text-right">Funcionários</TableHead>
                 <TableHead className="text-right">Produtos</TableHead>
                 <TableHead className="text-right">Qtd. vendida</TableHead>
-                <TableHead className="text-right">Faturamento apurado</TableHead>
-                <TableHead className="text-right">Subtotais impressos</TableHead>
-                <TableHead className="text-right">Total impresso na aba</TableHead>
-                <TableHead>Status</TableHead>
+                <TableHead className="text-right">Faturamento</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -1600,27 +1621,8 @@ function ConferenciaCard({ result }: { result: AnalysisResult }) {
                   <TableCell className="text-right">{a.clientesCarteira}</TableCell>
                   <TableCell className="text-right text-muted-foreground">{a.funcionarios}</TableCell>
                   <TableCell className="text-right">{a.produtosDistintos}</TableCell>
-                  <TableCell className="text-right">
-                    {a.quantidadeTotal.toLocaleString("pt-BR", { maximumFractionDigits: 4 })}
-                  </TableCell>
-                  <TableCell className="text-right font-medium">{fmt(a.faturamentoApurado)}</TableCell>
-                  <TableCell className="text-right">{fmtOpc(a.subtotaisImpressos)}</TableCell>
-                  <TableCell className="text-right">{fmtOpc(a.totalImpresso)}</TableCell>
-                  <TableCell>
-                    {a.ok ? (
-                      <Badge variant="outline" className="border-accent/30 bg-accent/10 text-accent">
-                        Confere
-                      </Badge>
-                    ) : (
-                      <Badge
-                        variant="outline"
-                        className="border-destructive/30 bg-destructive/10 text-destructive"
-                        title={a.divergencias.join("\n")}
-                      >
-                        Divergente
-                      </Badge>
-                    )}
-                  </TableCell>
+                  <TableCell className="text-right">{fmtQtd(a.quantidadeTotal)}</TableCell>
+                  <TableCell className="text-right font-medium">{fmt(a.faturamento)}</TableCell>
                 </TableRow>
               ))}
               <TableRow className="font-semibold">
@@ -1629,31 +1631,19 @@ function ConferenciaCard({ result }: { result: AnalysisResult }) {
                 <TableCell className="text-right">{c.consolidado.clientesDistintos}</TableCell>
                 <TableCell className="text-right">{c.consolidado.funcionariosDistintos}</TableCell>
                 <TableCell className="text-right">{c.consolidado.produtosDistintos}</TableCell>
-                <TableCell className="text-right">
-                  {c.consolidado.quantidadeTotal.toLocaleString("pt-BR", { maximumFractionDigits: 4 })}
-                </TableCell>
+                <TableCell className="text-right">{fmtQtd(c.consolidado.quantidadeTotal)}</TableCell>
                 <TableCell className="text-right">{fmt(c.consolidado.faturamento)}</TableCell>
-                <TableCell colSpan={3} className="text-xs font-normal text-muted-foreground">
-                  clientes e produtos distintos na janela
-                </TableCell>
               </TableRow>
             </TableBody>
           </Table>
         </div>
-
-        {falhas.length > 0 && (
-          <div className="space-y-1 px-6 pb-5">
-            <p className="text-sm font-semibold text-destructive">
-              Divergências ({falhas.length}) — estes números não conferem com a planilha:
-            </p>
-            {falhas.map((f, i) => (
-              <p key={i} className="text-sm text-muted-foreground">
-                <span className="font-medium text-foreground">{f.escopo}</span> · {f.descricao}:{" "}
-                {f.detalhe}
-              </p>
-            ))}
-          </div>
-        )}
+        <p className="px-6 pb-5 text-xs text-muted-foreground">
+          Na linha da janela, clientes e produtos são os distintos em todos os meses.
+          {comDescarte.length > 0 &&
+            ` Linhas com valor que não são venda nem total: ${comDescarte
+              .map((a) => `${a.aba} (${a.linhasDescartadas}, ${fmt(a.valorDescartado)})`)
+              .join("; ")} — veja os alertas.`}
+        </p>
       </CardContent>
     </Card>
   );

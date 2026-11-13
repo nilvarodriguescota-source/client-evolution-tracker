@@ -33,9 +33,7 @@ export interface ValidationDiagnostic {
     | "traceability"
     | "math"
     | "duplicate"
-    | "cross-field"
-    /** Spreadsheet × processed figures: what the file says against what the system computed */
-    | "conferencia";
+    | "cross-field";
   severity: ValidationSeverity;
   /** Excel cell reference (e.g. "Sheet1!B12") */
   cellRef: string;
@@ -493,39 +491,6 @@ export class ExcelValidator {
     }
 
     return duplicates;
-  }
-
-  // ---- Conferência: spreadsheet × processed ---------------------------------
-
-  /**
-   * Compares a figure taken from the spreadsheet with the figure the system
-   * computed from it. A divergence is always an error: a number that does not
-   * match the file must never be presented as valid.
-   */
-  checkConferencia(
-    esperado: number,
-    apurado: number,
-    cellRefOrigem: string,
-    field: string,
-    descricao: string,
-    tolerance = 0.005,
-  ): boolean {
-    const diff = preciseRound(Math.abs(esperado - apurado), PRECISION_DIGITS);
-    // NaN (a figure that was never computed) is a divergence, not a pass.
-    if (!(diff <= tolerance)) {
-      this.fail({
-        layer: "conferencia",
-        severity: "error",
-        cellRef: cellRefOrigem,
-        field,
-        actual: `${apurado} (apurado pelo sistema)`,
-        expected: `${esperado} (planilha)`,
-        impact: `${descricao}: divergência de ${diff.toFixed(4)} entre a planilha e o valor processado.`,
-      });
-      return false;
-    }
-    this.pass("conferencia");
-    return true;
   }
 
   // ---- Cross-field consistency -----------------------------------------------

@@ -87,14 +87,53 @@ describe("tela · seis meses com funcionários", () => {
     expect(screen.getAllByText("Compras de funcionários").length).toBeGreaterThan(0);
   });
 
-  it("presta contas na aba Validação: conferência das seis abas e funcionários", () => {
+  it("tela de conferência sem subtotais impressos, total impresso e status", () => {
     const { result } = renderAnalise();
-    expect(result.conferencia.ok).toBe(true);
     abrirAba(/Validação/);
 
-    expect(screen.getByText("Conferência planilha × sistema")).toBeInTheDocument();
-    expect(screen.getAllByText("Confere")).toHaveLength(6);
+    const titulo = screen.getByText("Conferência dos dados da planilha");
+    const cartao = titulo.closest(".rounded-lg") as HTMLElement;
+    const cabecalhos = within(cartao)
+      .getAllByRole("columnheader")
+      .map((h) => h.textContent);
+    expect(cabecalhos).toEqual([
+      "Aba",
+      "Registros",
+      "Clientes",
+      "Funcionários",
+      "Produtos",
+      "Qtd. vendida",
+      "Faturamento",
+    ]);
+    expect(screen.queryByText(/Subtotais impressos/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Total impresso/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/planilha × sistema/i)).not.toBeInTheDocument();
+    expect(within(cartao).queryByText("Status")).not.toBeInTheDocument();
+    expect(within(cartao).queryByText("Confere")).not.toBeInTheDocument();
+    expect(within(cartao).queryByText("Divergente")).not.toBeInTheDocument();
+
+    // one unit per sale in this file: 3 + 3 + 2 + 2 + 2 + 3 sale rows
+    expect(result.conferencia.abas.map((a) => a.quantidadeTotal)).toEqual([3, 3, 2, 2, 2, 3]);
+    const linhaJan = within(cartao).getAllByRole("row").find((r) => r.textContent?.startsWith("janeiro"))!;
+    expect(linhaJan.textContent).toContain(fmt(3280.46));
+
     expect(screen.getByText("Funcionários (2)")).toBeInTheDocument();
     expect(screen.getAllByText("*MARIA SILVA").length).toBeGreaterThan(0);
+  });
+
+  it("mostra a movimentação de cada mês (alta, queda, estável) no comparativo", () => {
+    const { result } = renderAnalise();
+    const esperado = result.evolucaoPeriodos.map((p) => p.movimentacao);
+    // jan → fev +6,4% alta · fev → mar −53% queda · mar → abr +56% alta · abr → mai +7% alta · mai → jun +9% alta
+    expect(esperado).toEqual([null, "crescimento", "queda", "crescimento", "crescimento", "crescimento"]);
+    const tabela = screen.getByRole("columnheader", { name: "Movimentação" }).closest("table")!;
+    const linhas = within(tabela).getAllByRole("row").slice(1);
+    const lido = linhas.map((r) => {
+      const t = r.textContent ?? "";
+      return t.includes("Alta") ? "Alta" : t.includes("Queda") ? "Queda" : t.includes("Estável") ? "Estável" : "—";
+    });
+    expect(lido).toEqual(["—", "Alta", "Queda", "Alta", "Alta", "Alta"]);
+    // units sold are shown in the same table
+    expect(within(tabela).getByRole("columnheader", { name: "Qtd. Vendida" })).toBeInTheDocument();
   });
 });

@@ -126,6 +126,9 @@ const esperadoFuncionariosCentavos = MESES.map((_, m) =>
     .filter((c) => c.nome.startsWith("*"))
     .reduce((s, c) => s + c.vendas.reduce((a, x) => a + x.centavos, 0), 0),
 );
+const esperadoQuantidade = MESES.map(
+  (_, m) => Math.round(compradoresDoMes(m).reduce((s, c) => s + c.vendas.reduce((a, x) => a + x.qtd, 0), 0) * 10000) / 10000,
+);
 const esperadoRegistros = MESES.map((_, m) =>
   compradoresDoMes(m).reduce((s, c) => s + c.vendas.length, 0),
 );
@@ -263,11 +266,6 @@ function pastaXml2003(): ArrayBuffer {
 
 const centavos = (v: number) => Math.round(v * 100);
 
-/** Every check of the conferência, failing ones listed for a readable error. */
-function divergencias(r: AnalysisResult): string[] {
-  return r.conferencia.itens.filter((i) => !i.ok).map((i) => `${i.escopo} · ${i.descricao}: ${i.detalhe}`);
-}
-
 // ---------------------------------------------------------------------------
 // Leitura de números
 // ---------------------------------------------------------------------------
@@ -352,15 +350,31 @@ describe.each(formatos)("apuração das 6 abas · %s", (_, gerar) => {
     expect(r.periodos.map((p) => p.leituraAba.linhasDescartadas)).toEqual(MESES.map(() => []));
   });
 
-  it("confere com os subtotais e totais impressos em todas as abas", () => {
-    expect(divergencias(r)).toEqual([]);
-    expect(r.conferencia.ok).toBe(true);
-    expect(r.conferencia.abas.every((a) => a.ok)).toBe(true);
-    // the printed totals were really found and compared, not skipped
-    expect(r.conferencia.abas.every((a) => a.totalImpresso !== null && a.subtotaisImpressos !== null)).toBe(true);
+  it("apura tudo só pela planilha, sem divergências nem cruzamentos", () => {
     const erros = r.validationReport.diagnostics.filter((d) => d.severity === "error");
     expect(erros.map((d) => `${d.cellRef} ${d.field}: ${d.impact}`)).toEqual([]);
     expect(r.validationReport.valid).toBe(true);
+    expect(r.conferencia.abas.map((a) => centavos(a.faturamento))).toEqual(esperadoCentavos);
+    expect(r.conferencia.abas.map((a) => a.registrosVenda)).toEqual(esperadoRegistros);
+  });
+
+  it("soma as unidades vendidas sem os somatórios por cliente nem os totais por unidade", () => {
+    // subtotal rows repeat each client's units and the "Totais por unidade"
+    // block repeats the tab's: none of them may be counted again.
+    expect(r.periodos.map((p) => p.leituraAba.quantidadeTotal)).toEqual(esperadoQuantidade);
+    expect(r.conferencia.abas.map((a) => a.quantidadeTotal)).toEqual(esperadoQuantidade);
+    expect(r.evolucaoPeriodos.map((p) => p.quantidade)).toEqual(esperadoQuantidade);
+    expect(r.conferencia.consolidado.quantidadeTotal).toBe(esperadoQuantidade.reduce((a, b) => a + b, 0));
+  });
+
+  it("classifica a movimentação de cada mês em alta, queda ou estável", () => {
+    const esperado = esperadoCentavos.map((v, i) => {
+      if (i === 0) return null;
+      const ant = esperadoCentavos[i - 1];
+      const variacao = ((v - ant) / ant) * 100;
+      return Math.abs(variacao) < 5 ? "estavel" : variacao > 0 ? "crescimento" : "queda";
+    });
+    expect(r.evolucaoPeriodos.map((p) => p.movimentacao)).toEqual(esperado);
   });
 
   it("mantém os funcionários (*) no faturamento", () => {
@@ -458,41 +472,38 @@ describe.each(formatos)("apuração das 6 abas · %s", (_, gerar) => {
 // Divergências entre planilha e sistema
 // ---------------------------------------------------------------------------
 
-describe("conferência sinaliza o que não confere com a planilha", () => {
-  it("subtotal impresso diferente da soma das vendas do cliente", () => {
+describe("a planilha é a única fonte: nada é cruzado com totais impressos", () => {
+  it("subtotal impresso diferente não altera o faturamento nem gera divergência", () => {
     const r = analyzeWorkbook(
       pasta((m) => ({ formato: "texto-br", subtotalErrado: m === 2 ? 999999 : undefined })),
     );
-    // the revenue stays the sum of the sale rows, never the printed figure
     expect(centavos(r.periodos[2].totalFaturamento)).toBe(esperadoCentavos[2]);
-    expect(r.conferencia.ok).toBe(false);
-    expect(r.conferencia.abas.map((a) => a.ok)).toEqual([true, true, false, true, true, true]);
-    expect(r.validationReport.valid).toBe(false);
-    expect(r.inconsistencias.some((i) => i.startsWith("Conferência · Aba março 2026"))).toBe(true);
+    expect(r.periodos[2].leituraAba.quantidadeTotal).toBe(esperadoQuantidade[2]);
+    expect(r.validationReport.valid).toBe(true);
+    expect(r.inconsistencias.filter((i) => /subtotal|impresso|confer/i.test(i))).toEqual([]);
   });
 
-  it("total impresso na aba diferente do faturamento apurado", () => {
+  it("total impresso na aba diferente é ignorado", () => {
     const r = analyzeWorkbook(pasta((m) => ({ formato: "numero", totalErrado: m === 5 ? 1 : undefined })));
-    const junho = r.conferencia.abas[5];
-    expect(junho.ok).toBe(false);
-    expect(junho.divergencias.join(" ")).toContain("Totais por unidade");
-    expect(r.validationReport.diagnostics.some((d) => d.layer === "conferencia" && d.severity === "error")).toBe(true);
+    expect(centavos(r.periodos[5].totalFaturamento)).toBe(esperadoCentavos[5]);
+    expect(r.validationReport.valid).toBe(true);
   });
 
-  it("valor solto na aba, fora de qualquer cliente", () => {
+  it("valor solto na aba, fora de qualquer cliente, é apontado e não entra no faturamento", () => {
     const r = analyzeWorkbook(pasta((m) => ({ formato: "numero", linhaSolta: m === 0 })));
     const jan = r.conferencia.abas[0];
     expect(jan.valorDescartado).toBe(123.45);
-    expect(jan.ok).toBe(false);
-    expect(r.conferencia.ok).toBe(false);
+    expect(centavos(jan.faturamento)).toBe(esperadoCentavos[0]);
+    expect(r.inconsistencias.some((i) => i.includes("fora de qualquer bloco de cliente"))).toBe(true);
   });
 
-  it("o mesmo mês em duas abas", () => {
+  it("o mesmo mês em duas abas é apontado como erro", () => {
     const nomes = [...ROTULOS];
     nomes[5] = "maio 2026 (2)";
     const r = analyzeWorkbook(pasta(() => ({ formato: "numero" }), "xlsx", nomes));
-    expect(r.conferencia.ok).toBe(false);
-    expect(divergencias(r).join(" ")).toContain("o mesmo mês aparece nas abas");
+    expect(
+      r.validationReport.diagnostics.some((d) => d.severity === "error" && d.impact.includes("mais de uma aba")),
+    ).toBe(true);
     // both tabs are still visible as separate columns — none overwrites the other
     expect(new Set(r.periodos.map((p) => p.nome)).size).toBe(6);
   });
@@ -519,7 +530,7 @@ describe("regressões da leitura das linhas", () => {
     expect(alfa.produtos[0].valorTotal).toBe(4200);
   });
 
-  it('linha "Total:" com valor é subtotal do cliente, não um produto', () => {
+  it('linha "Total:" com valor é somatório do cliente, não um produto', () => {
     const r = analyzeWorkbook(
       abasCruas({
         junho: [["Cliente: 1 - A"], CAB, ["10", "X", "UN", 2, 5, 10], ["Total:", null, null, 2, null, 10]],
@@ -529,8 +540,7 @@ describe("regressões da leitura das linhas", () => {
     const a = [...r.periodos[0].clientes.values()][0];
     expect(a.produtos).toHaveLength(1);
     expect(a.totalGeral).toBe(10);
-    expect(a.subtotalImpresso).toBe(10);
-    expect(r.conferencia.ok).toBe(true);
+    expect(r.periodos[0].leituraAba.quantidadeTotal).toBe(2);
   });
 
   it("venda sem código de produto entra no faturamento e é sinalizada", () => {
@@ -543,7 +553,7 @@ describe("regressões da leitura das linhas", () => {
     expect(r.periodos[0].totalFaturamento).toBe(17.5);
     expect(r.periodos[0].produtosLidos).toBe(2);
     expect(r.validationReport.diagnostics.some((d) => d.impact.includes("sem código"))).toBe(true);
-    expect(r.conferencia.ok).toBe(true);
+    expect(r.periodos[0].leituraAba.quantidadeTotal).toBe(3);
   });
 
   it('cabeçalho de cliente com "Cliente:" numa célula e o nome na seguinte', () => {
@@ -569,6 +579,104 @@ describe("regressões da leitura das linhas", () => {
     );
     expect(r.comparativoProdutos).toHaveLength(1);
     expect(r.comparativoProdutos[0].valorPorPeriodo).toEqual({ junho: 10, julho: 20 });
+  });
+});
+
+describe("quantidade vendida", () => {
+  const qtd = (r: AnalysisResult, i = 0) => r.periodos[i].leituraAba.quantidadeTotal;
+
+  it("soma todas as colunas de quantidade vendida da planilha", () => {
+    const cab = ["Código", "Descrição", "UN", "Qtd. venda", "Qtd. bonificação", "Preço médio venda", "Venda bruta"];
+    const r = analyzeWorkbook(
+      abasCruas({
+        junho: [
+          ["Cliente: 1 - A"],
+          cab,
+          ["10", "X", "UN", 10, 2, 5, 50],
+          ["11", "Y", "UN", 3, null, 4, 12],
+          [null, null, null, 13, 2, null, 62],
+        ],
+        julho: abaSimples,
+      }),
+    );
+    expect(r.periodos[0].clientes.get("cod:1")!.produtos.map((p) => p.quantidade)).toEqual([12, 3]);
+    expect(qtd(r)).toBe(15);
+    expect(r.periodos[0].totalFaturamento).toBe(62);
+    // the unit price refers to "Qtd. venda": 10 × 5 = 50 is consistent
+    expect(r.inconsistencias).toEqual([]);
+  });
+
+  it("não soma colunas que não são unidades vendidas nem valores em dinheiro", () => {
+    const cab = ["Código", "Descrição", "Qtd. venda", "Qtd. devolvida", "Preço médio", "Venda bruta", "Qtd. total"];
+    const r = analyzeWorkbook(
+      abasCruas({
+        junho: [["Cliente: 1 - A"], cab, ["10", "X", 4, 1, 10, 40, 4]],
+        julho: abaSimples,
+      }),
+    );
+    // "Qtd. total" is units and is summed; "Qtd. devolvida" is not a sale;
+    // "Venda bruta" stays the value column — never the units.
+    expect(qtd(r)).toBe(8);
+    expect(r.periodos[0].totalFaturamento).toBe(40);
+  });
+
+  it.each([
+    ["sem código nem descrição", [null, null, null, 5, null, 50]],
+    ['com "Total do cliente:" em outra coluna', [null, null, "Total do cliente:", 5, null, 50]],
+    ["com o nome do cliente na descrição", [null, "ALFA LTDA", null, 5, null, 50]],
+    ["com o código do cliente", ["1", null, null, 5, null, 50]],
+    ["repetindo a soma das vendas do bloco", [null, "TOTAL", null, 5, null, 50]],
+    ["sem rótulo, repetindo a soma das vendas", [null, "  ", null, 5, null, 50]],
+    ['com "Qtde. total:" no código', ["Qtde. total:", null, null, 5, null, 50]],
+  ])("não conta de novo o somatório do cliente %s", (_, linhaSoma) => {
+    const r = analyzeWorkbook(
+      abasCruas({
+        junho: [
+          ["Cliente: 1 - ALFA LTDA"],
+          CAB,
+          ["10", "X", "UN", 2, 10, 20],
+          ["11", "Y", "UN", 3, 10, 30],
+          linhaSoma as Celula[],
+          [],
+          ["Totais por unidade:"],
+          ["UN", null, null, 5, null, 50],
+        ],
+        julho: abaSimples,
+      }),
+    );
+    expect(qtd(r)).toBe(5);
+    expect(r.periodos[0].produtosLidos).toBe(2);
+    expect(r.periodos[0].totalFaturamento).toBe(50);
+  });
+
+  it("conta cada venda uma única vez, inclusive com o cliente em dois blocos", () => {
+    const r = analyzeWorkbook(
+      abasCruas({
+        junho: [
+          ["Cliente: 1 - A"],
+          CAB,
+          ["10", "X", "UN", 2, 10, 20],
+          [null, null, null, 2, null, 20],
+          ["Página 1 de 2"],
+          ["Cliente: 1 - A"],
+          CAB,
+          ["11", "Y", "UN", 7, 1, 7],
+          [null, null, null, 7, null, 7],
+        ],
+        julho: abaSimples,
+      }),
+    );
+    expect(qtd(r)).toBe(9);
+    expect(r.periodos[0].totalFaturamento).toBe(27);
+  });
+});
+
+describe("movimentação de vendas entre os meses", () => {
+  it("aponta alta, queda e estabilidade a partir do faturamento da planilha", () => {
+    const aba = (valor: number): Celula[][] => [["Cliente: 1 - A"], CAB, ["10", "X", "UN", 1, valor, valor]];
+    const r = analyzeWorkbook(abasCruas({ marco: aba(100), abril: aba(150), maio: aba(100), junho: aba(102) }));
+    expect(r.evolucaoPeriodos.map((p) => p.movimentacao)).toEqual([null, "crescimento", "queda", "estavel"]);
+    expect(r.evolucaoPeriodos.map((p) => p.variacaoFaturamento)).toEqual([null, 50, -33.3333, 2]);
   });
 });
 
