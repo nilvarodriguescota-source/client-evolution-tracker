@@ -628,6 +628,14 @@ describe("quantidade vendida", () => {
     ["repetindo a soma das vendas do bloco", [null, "TOTAL", null, 5, null, 50]],
     ["sem rótulo, repetindo a soma das vendas", [null, "  ", null, 5, null, 50]],
     ['com "Qtde. total:" no código', ["Qtde. total:", null, null, 5, null, 50]],
+    ["com a unidade de medida na coluna de código", ["UN", null, null, 5, null, 50]],
+    ["com a unidade de medida e só a quantidade", ["UN", null, null, 5, null, null]],
+    ["só com a quantidade", [null, null, null, 5, null, null]],
+    ["com a unidade de medida na coluna de descrição", [null, "UN", null, 5, null, 50]],
+    ["com a unidade de medida em todas as colunas de texto", ["KG", "KG", "KG", 5, null, 50]],
+    ["com um número na coluna de código", [5, null, null, 5, null, 50]],
+    ["com código mas sem produto", ["10", null, null, 5, null, 50]],
+    ["com código e nome do cliente", [null, "1 - ALFA LTDA", null, 5, null, 50]],
   ])("não conta de novo o somatório do cliente %s", (_, linhaSoma) => {
     const r = analyzeWorkbook(
       abasCruas({
@@ -647,6 +655,49 @@ describe("quantidade vendida", () => {
     expect(qtd(r)).toBe(5);
     expect(r.periodos[0].produtosLidos).toBe(2);
     expect(r.periodos[0].totalFaturamento).toBe(50);
+    expect(r.evolucaoPeriodos[0].quantidade).toBe(5);
+    expect(r.conferencia.abas[0].quantidadeTotal).toBe(5);
+    // the client's own sum is not an error of the spreadsheet
+    expect(r.inconsistencias).toEqual([]);
+  });
+
+  it("soma a Qtd. venda de cada produto de vários clientes, cada um com seu somatório abaixo", () => {
+    // as the report prints it: products of the client, then the client's sum
+    const r = analyzeWorkbook(
+      abasCruas({
+        junho: [
+          ["Vendas de produto no período"],
+          ["Cliente: 1001 - ALFA LTDA"],
+          CAB,
+          ["5001", "ARROZ 5KG", "UN", 120, 3.5, 420],
+          ["5002", "FEIJAO 1KG", "UN", 50, 8, 400],
+          ["5010", "CARNE BOVINA", "KG", 12.5, 40, 500],
+          ["UN", null, null, 182.5, null, 1320],
+          [],
+          ["Cliente: 1002 - BETA MERCEARIA"],
+          CAB,
+          ["5004", "OLEO 900ML", "CX", 3, 100, 300],
+          [null, null, "CX", 3, null, 300],
+          [],
+          ["Cliente: 2001 - *MARIA SILVA"],
+          CAB,
+          ["5007", "CAFE 500G", "UN", 2, 15.5, 31],
+          [null, null, null, 2, null, 31],
+          [],
+          ["Totais por unidade:"],
+          ["UN", null, null, 172, null, 851],
+          ["KG", null, null, 12.5, null, 500],
+          ["CX", null, null, 3, null, 300],
+        ],
+        julho: abaSimples,
+      }),
+    );
+    // 120 + 50 + 12,5 + 3 + 2 — each product's Qtd. venda, once
+    expect(qtd(r)).toBe(187.5);
+    expect(r.evolucaoPeriodos[0].quantidade).toBe(187.5);
+    expect(r.conferencia.abas[0].quantidadeTotal).toBe(187.5);
+    expect(r.periodos[0].produtosLidos).toBe(5);
+    expect(r.periodos[0].totalFaturamento).toBe(1651);
   });
 
   it("conta cada venda uma única vez, inclusive com o cliente em dois blocos", () => {
@@ -668,6 +719,53 @@ describe("quantidade vendida", () => {
     );
     expect(qtd(r)).toBe(9);
     expect(r.periodos[0].totalFaturamento).toBe(27);
+  });
+});
+
+describe("layout real do relatório de vendas", () => {
+  // As the ERP exports it: the product header once at the top, a "Cliente:" line
+  // per client, its products, a sum line ("" code) only when the client bought
+  // two or more items, then the tab's grand total and the per-unit totals —
+  // printed without a label and shifted: unit | qty | qty | VALUE | 0 | 0.
+  const aba = (fator: number): Celula[][] => [
+    ["Código", "Descrição", "UN", "Qtd. venda", "Preço médio venda", "Venda bruta"],
+    [null, null, null, null, null, null],
+    ["Cliente: 22908 - *ANA MARIA - Data da última compra: 08/05/2026", null, null, null, null, null],
+    [null, null, null, null, null, null],
+    ["2275", "(UAI) PAO DE BATATA REQUEIJAO 20 UND", "PCT", 2 * fator, 83.18, 166.36 * fator],
+    [null, null, null, null, null, null],
+    ["Cliente: 1001 - PADARIA ALFA - Data da última compra: 15/05/2026 - Celular: (0xx48)99999-0000", null, null, null, null, null],
+    [null, null, null, null, null, null],
+    ["3046", "(NEVASCA) MINI CROISSANT CHOCOLATE 1KG", "PCT", 2 * fator, 43.62, 87.24 * fator],
+    ["5531", "(O PADEIRO) PUDIM LEITE MOÇA 135G 12 UND", "CX", 1 * fator, 70, 70 * fator],
+    ["1158", "(FERFUR) MINI BOLINHA QUEIJO 1,5KG", "KG", 3 * fator, 10, 30 * fator],
+    ["", null, null, 6 * fator, null, 187.24 * fator],
+    [null, null, null, null, null, null],
+    ["", null, null, 8 * fator, null, 353.6 * fator],
+    [null, null, null, null, null, null],
+    ["PCT", 4 * fator, 4 * fator, 253.6 * fator, 0, 0],
+    ["CX", 1 * fator, 1 * fator, 70 * fator, 0, 0],
+    ["KG", 3 * fator, 3 * fator, 30 * fator, 0, 0],
+    ["BANDEJ", 0, 0, 0, 0, 0],
+    [null, null, null, null, null, null],
+    ["Quantidade total de clientes listados: 2", null, null, null, null, null],
+    ["Gerado em 13/11/26 09:46:15", null, null, null, null, null],
+  ];
+
+  it("soma só a Qtd. venda dos produtos: sem a soma do cliente, o total geral e os totais por unidade", () => {
+    const r = analyzeWorkbook(abasCruas({ maio: aba(1), junho: aba(2) }));
+    // 2 + 2 + 1 + 3 — the sum lines (6, 8) and the per-unit rows (whose third
+    // number is money, R$ 253,60) are never counted as units
+    expect(r.periodos.map((p) => p.leituraAba.quantidadeTotal)).toEqual([8, 16]);
+    expect(r.evolucaoPeriodos.map((p) => p.quantidade)).toEqual([8, 16]);
+    expect(r.conferencia.abas.map((a) => a.quantidadeTotal)).toEqual([8, 16]);
+    expect(r.periodos.map((p) => p.totalFaturamento)).toEqual([353.6, 707.2]);
+    expect(r.periodos.map((p) => p.produtosLidos)).toEqual([4, 4]);
+    // 1 client + 1 employee = the 2 clients listed by the report
+    expect(r.periodos[0].clientesCarteira.size).toBe(1);
+    expect(r.periodos[0].funcionarios.size).toBe(1);
+    expect(r.inconsistencias).toEqual([]);
+    expect(r.validationReport.valid).toBe(true);
   });
 });
 
